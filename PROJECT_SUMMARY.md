@@ -3,7 +3,8 @@
 A single double-click `.bat` file that generates a comprehensive Windows system health report in ~10 seconds.
 
 ## Features
-- **Interactive section picker** -- toggle any of 16 sections on/off before running
+- **Scorecard summary** -- compact at-a-glance grid with OK/WARN/FAIL per metric
+- **Interactive section picker** -- toggle any of 7 sections on/off before running
 - **Color-coded console output** -- green/yellow/red at-a-glance health indicators
 - **Overall health grade** -- A/B/C/D/F letter grade with 0-100 score
 - **Actionable recommendations** -- specific fix suggestions based on findings
@@ -12,26 +13,19 @@ A single double-click `.bat` file that generates a comprehensive Windows system 
 - **CLI automation** -- `/all`, `/quiet`, `/sections:disk,memory`, `/clipboard` flags
 - **Auto-elevates** to admin (needed for event log access)
 
-## The 16 Sections
+## The 7 Sections
 
 | # | Section | What It Shows |
 |---|---------|--------------|
 | 1 | System Info | OS, CPU, last Windows update |
-| 2 | Stability Score | Windows Reliability Index (1-10) with 7-day trend |
-| 3 | Blue Screens | BSODs with bugcheck codes + human-readable names |
-| 4 | Last Shutdown | Clean vs crash vs sleep, power event timeline |
-| 5 | Sleep/DRIPS Analyzer | Per-session SW/HW DRIPS %, averages, good/poor counts |
-| 6 | Boot Performance | Boot duration breakdown, uptime |
-| 7 | Boot Degradation | Exact processes that slowed boot (e.g. svchost +16.4s) |
-| 8 | Shutdown Performance | Shutdown duration + which services delayed it |
-| 9 | App Crashes & Hangs | User-mode crashes and frozen processes |
-| 10 | Memory & Page File | RAM usage + page file current/peak |
-| 11 | Disk Health | SMART status, temperature, wear, volume free space |
-| 12 | Windows Update Health | Failed update events with error codes |
-| 13 | Startup Programs | Auto-run programs at login |
-| 14 | Network Adapters | Status, link speed, connection state |
-| 15 | GPU / Display | GPU name, driver version/date, VRAM, resolution |
-| 16 | Battery Health | Wear level, cycle count, design vs current capacity |
+| 2 | Stability & Blue Screens | Reliability Index + BSOD bugcheck codes |
+| 3 | Boot & Shutdown | Boot duration, degradation, last shutdown type + timing |
+| 4 | Memory & Page File | RAM usage + page file current/peak |
+| 5 | Disk Health | SMART status, temperature, wear, volume free space |
+| 6 | App Crashes & Hangs | User-mode crashes and frozen processes |
+| 7 | Network Adapters | Status, link speed, connection state |
+
+Additional data (sleep DRIPS, Windows Updates, GPU, battery) is collected silently and feeds the scorecard and recommendations without adding verbose output.
 
 ## Command-Line Flags
 

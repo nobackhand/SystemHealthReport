@@ -133,22 +133,13 @@ function Get-ProgressBar {
 # ============================================================
 
 $global:sections = [ordered]@{
-    'sysinfo'       = @{ Name = 'System Info';                Enabled = $true }
-    'stability'     = @{ Name = 'Stability Score';            Enabled = $true }
-    'bsod'          = @{ Name = 'Blue Screens / Bugchecks';   Enabled = $true }
-    'shutdown'      = @{ Name = 'Last Shutdown / Power State'; Enabled = $true }
-    'sleep'         = @{ Name = 'Sleep / DRIPS Analyzer';     Enabled = $true }
-    'bootperf'      = @{ Name = 'Boot Performance';           Enabled = $true }
-    'bootdegrade'   = @{ Name = 'Boot Degradation Details';   Enabled = $true }
-    'shutdownperf'  = @{ Name = 'Shutdown Performance';       Enabled = $true }
-    'crashes'       = @{ Name = 'App Crashes & Hangs';        Enabled = $true }
-    'memory'        = @{ Name = 'Memory & Page File';         Enabled = $true }
-    'disk'          = @{ Name = 'Disk Health';                Enabled = $true }
-    'updates'       = @{ Name = 'Windows Update Health';      Enabled = $true }
-    'startup'       = @{ Name = 'Startup Programs';           Enabled = $true }
-    'network'       = @{ Name = 'Network Adapters';           Enabled = $true }
-    'gpu'           = @{ Name = 'GPU / Display';              Enabled = $true }
-    'battery'       = @{ Name = 'Battery Health';             Enabled = $true }
+    'sysinfo'    = @{ Name = 'System Info';                 Enabled = $true }
+    'stability'  = @{ Name = 'Stability & Blue Screens';    Enabled = $true }
+    'boot'       = @{ Name = 'Boot & Shutdown Performance'; Enabled = $true }
+    'memory'     = @{ Name = 'Memory & Page File';          Enabled = $true }
+    'disk'       = @{ Name = 'Disk Health';                 Enabled = $true }
+    'crashes'    = @{ Name = 'App Crashes & Hangs';         Enabled = $true }
+    'network'    = @{ Name = 'Network Adapters';            Enabled = $true }
 }
 
 # Apply CLI arguments to section state
@@ -282,9 +273,11 @@ function Run-SysInfo {
     } catch { Write-Both "  Could not retrieve system info: $_" -Color Yellow }
 }
 
-# --- 2. Stability Score ---
-function Run-Stability {
-    Write-Header "SYSTEM STABILITY SCORE"
+# --- 2. Stability & Blue Screens (merged) ---
+function Run-StabilityAndBSOD {
+    Write-Header "STABILITY & BLUE SCREENS"
+
+    # -- Stability Score --
     try {
         $metrics = Get-CimInstance -ClassName Win32_ReliabilityStabilityMetrics -ErrorAction SilentlyContinue |
             Sort-Object TimeGenerated -Descending | Select-Object -First 7
@@ -294,8 +287,7 @@ function Run-Stability {
             $scoreColor = if ($current -ge 8) { [ConsoleColor]::Green }
                           elseif ($current -ge 5) { [ConsoleColor]::Yellow }
                           else { [ConsoleColor]::Red }
-            Write-KV "Current Score" "$currentRound / 10" -ValueColor $scoreColor
-            Write-Both "  (10 = perfectly stable, lower = more failures)" -Color Gray
+            Write-KV "Stability Score" "$currentRound / 10" -ValueColor $scoreColor
 
             $global:gradeData['stability'] = $current
 
@@ -314,26 +306,14 @@ function Run-Stability {
                               else { [ConsoleColor]::White }
                 Write-KV "7-Day Trend" $trendStr -ValueColor $trendColor
             }
-
-            Write-Both "  Last 7 days:" -Color Gray
-            foreach ($m in $metrics) {
-                $day = $m.TimeGenerated.ToString("yyyy-MM-dd")
-                $score = [math]::Round($m.SystemStabilityIndex, 1)
-                $bar = "#" * [math]::Round($score)
-                $c = if ($score -ge 8) { [ConsoleColor]::Green }
-                     elseif ($score -ge 5) { [ConsoleColor]::Yellow }
-                     else { [ConsoleColor]::Red }
-                Write-Both "    $day  $($bar.PadRight(10))  $score" -Color $c
-            }
         } else {
             Write-Both "  Reliability data not available." -Color Yellow
         }
     } catch { Write-Both "  Could not retrieve stability data: $_" -Color Yellow }
-}
 
-# --- 3. Blue Screens ---
-function Run-BSOD {
-    Write-Header "BLUE SCREENS / BUGCHECKS"
+    Write-Both "" -Color Gray
+
+    # -- Blue Screens / Bugchecks --
     try {
         $bugchecks = Get-WinEvent -FilterHashtable @{
             LogName='System'; ProviderName='Microsoft-Windows-WER-SystemErrorReporting'; Id=1001
@@ -379,192 +359,11 @@ function Run-BSOD {
     } catch { Write-Both "  Could not query bugcheck events: $_" -Color Yellow }
 }
 
-# --- 4. Last Shutdown ---
-function Run-Shutdown {
-    Write-Header "LAST SHUTDOWN / POWER STATE"
-    try {
-        $shutdownEvents = Get-WinEvent -FilterHashtable @{
-            LogName='System'; Id=1074,6005,6006,6008
-        } -MaxEvents 30 -ErrorAction SilentlyContinue
+# --- 3. Boot & Shutdown Performance (merged) ---
+function Run-BootAndShutdown {
+    Write-Header "BOOT & SHUTDOWN PERFORMANCE"
 
-        $powerEvents = Get-WinEvent -FilterHashtable @{
-            LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41,42,107
-        } -MaxEvents 20 -ErrorAction SilentlyContinue
-
-        $allEvents = @()
-        if ($shutdownEvents) { $allEvents += $shutdownEvents }
-        if ($powerEvents) { $allEvents += $powerEvents }
-        $allEvents = $allEvents | Sort-Object TimeCreated -Descending
-
-        $lastBoot = $allEvents | Where-Object { $_.Id -eq 6005 } | Select-Object -First 1
-        $shutdownType = "Unknown"; $shutdownColor = [ConsoleColor]::Yellow; $shutdownTime = "Unknown"
-
-        if ($lastBoot) {
-            $preBoot = $allEvents | Where-Object { $_.TimeCreated -lt $lastBoot.TimeCreated } | Select-Object -First 5
-            foreach ($evt in $preBoot) {
-                if ($evt.Id -eq 1074) {
-                    $shutdownTime = $evt.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
-                    $shutdownType = if ($evt.Message -match 'restart') { "Clean restart" } else { "Clean shutdown" }
-                    if ($evt.Message -match 'process (.+?) has initiated') { $shutdownType += " (by $($Matches[1].Trim()))" }
-                    elseif ($evt.Message -match 'The process (.+?) \(') { $shutdownType += " (by $($Matches[1].Trim()))" }
-                    $shutdownColor = [ConsoleColor]::Green; break
-                }
-                elseif ($evt.Id -eq 6008) {
-                    $shutdownTime = $evt.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
-                    $shutdownType = "UNEXPECTED SHUTDOWN (dirty/crash)"; $shutdownColor = [ConsoleColor]::Red; break
-                }
-                elseif ($evt.Id -eq 41) {
-                    $shutdownTime = $evt.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
-                    $shutdownType = "CRASH / POWER LOSS (Kernel-Power 41)"; $shutdownColor = [ConsoleColor]::Red; break
-                }
-                elseif ($evt.Id -eq 6006) {
-                    $shutdownTime = $evt.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
-                    $shutdownType = "Clean shutdown"; $shutdownColor = [ConsoleColor]::Green; break
-                }
-                elseif ($evt.Id -eq 42) {
-                    $shutdownTime = $evt.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
-                    $shutdownType = "Sleep / Hibernate"; $shutdownColor = [ConsoleColor]::Cyan; break
-                }
-            }
-        }
-        Write-KV "Shutdown Type" $shutdownType -ValueColor $shutdownColor
-        Write-KV "Shutdown Time" $shutdownTime
-
-        Write-Both "" -Color Gray
-        Write-Both "  Recent power events:" -Color Gray
-        $shown = 0
-        foreach ($evt in ($allEvents | Select-Object -First 15)) {
-            if ($shown -ge 8) { break }
-            $date = $evt.TimeCreated.ToString("yyyy-MM-dd HH:mm:ss")
-            $desc = switch ($evt.Id) {
-                6005 { "System boot (Event Log started)" }
-                6006 { "Clean shutdown (Event Log stopped)" }
-                6008 { "Unexpected shutdown detected" }
-                1074 { $a = if ($evt.Message -match 'restart') { "Restart" } else { "Shutdown" }; "$a initiated" }
-                41   { "Unexpected power loss (Kernel-Power 41)" }
-                42   { "Entering sleep / hibernate" }
-                107  { "Resume from sleep / hibernate" }
-                default { "Event $($evt.Id)" }
-            }
-            $color = switch ($evt.Id) {
-                6005 { [ConsoleColor]::Green }  6006 { [ConsoleColor]::Green }
-                6008 { [ConsoleColor]::Red }    1074 { [ConsoleColor]::Green }
-                41   { [ConsoleColor]::Red }    42   { [ConsoleColor]::Cyan }
-                107  { [ConsoleColor]::Cyan }   default { [ConsoleColor]::Gray }
-            }
-            Write-Both "    $date  $desc" -Color $color
-            $shown++
-        }
-    } catch { Write-Both "  Could not query shutdown events: $_" -Color Yellow }
-}
-
-# --- 5. Sleep / DRIPS Analyzer ---
-function Run-Sleep {
-    Write-Header "SLEEP / DRIPS ANALYZER"
-    try {
-        $xmlPath = Join-Path $env:TEMP "SHR_sleepstudy_$([System.IO.Path]::GetRandomFileName()).xml"
-        $null = & powercfg /sleepstudy /output $xmlPath /xml /duration 7 2>&1
-        if (-not (Test-Path $xmlPath)) {
-            Write-Both "  Sleep study data not available (Modern Standby may not be supported)." -Color Yellow
-            return
-        }
-        $xmlSettings = New-Object System.Xml.XmlReaderSettings
-        $xmlSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
-        $xmlSettings.XmlResolver = $null
-        $reader = [System.Xml.XmlReader]::Create($xmlPath, $xmlSettings)
-        $xmlData = New-Object System.Xml.XmlDocument
-        $xmlData.Load($reader)
-        $reader.Close()
-        Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
-
-        $ns = @{ss='http://schemas.microsoft.com/sleepstudy/2012'}
-        $sessions = Select-Xml -Xml $xmlData -Namespace $ns -XPath '//ss:OsStateInstance[@Type="Sleep"]'
-
-        if (-not $sessions -or $sessions.Count -eq 0) {
-            Write-Both "  No sleep sessions found in the last 7 days." -Color Gray
-            return
-        }
-
-        $results = @()
-        foreach ($s in $sessions) {
-            $node = $s.Node
-            $durTicks = [long]$node.Duration
-            $durUs = $durTicks / 10
-            if ($durUs -le 0) { continue }
-
-            $records = $node.CustomData.OSStateCustomData.OSStateRecord
-            $swDrips = 0; $hwDrips = 0
-            foreach ($r in $records) {
-                if ($r.Name -eq 'SW DRIPS Time') { $swDrips = [long]$r.Value }
-                if ($r.Name -eq 'HW DRIPS Time') { $hwDrips = [long]$r.Value }
-            }
-            $swPct = [math]::Round(($swDrips / $durUs) * 100, 1)
-            $hwPct = [math]::Round(($hwDrips / $durUs) * 100, 1)
-            $durMin = [math]::Round($durUs / 1000000 / 60, 1)
-
-            # Skip short cycles (< 10 min) -- they produce misleading DRIPS scores
-            if ($durMin -lt 10) { continue }
-
-            $results += [PSCustomObject]@{
-                Time = $node.LocalTimestamp
-                DurationMin = $durMin
-                SwDrips = $swPct
-                HwDrips = $hwPct
-                ExitReason = $node.ExitReason
-            }
-        }
-
-        if ($results.Count -eq 0) {
-            Write-Both "  No valid sleep sessions with DRIPS data." -Color Yellow
-            return
-        }
-
-        # Summary stats
-        $avgSw = [math]::Round(($results | Measure-Object -Property SwDrips -Average).Average, 1)
-        $avgHw = [math]::Round(($results | Measure-Object -Property HwDrips -Average).Average, 1)
-        $goodCount = ($results | Where-Object { $_.HwDrips -ge 80 }).Count
-        $poorCount = ($results | Where-Object { $_.HwDrips -lt 50 }).Count
-
-        $avgColor = if ($avgHw -ge 95) { [ConsoleColor]::Green }
-                    elseif ($avgHw -ge 80) { [ConsoleColor]::Green }
-                    elseif ($avgHw -ge 50) { [ConsoleColor]::Yellow }
-                    else { [ConsoleColor]::Red }
-
-        Write-KV "Sessions (7 days)" "$($results.Count) total"
-        Write-KV "Avg SW DRIPS" "$avgSw%"
-        Write-KV "Avg HW DRIPS" "$avgHw%" -ValueColor $avgColor
-        Write-KV "Good (>80% HW)" "$goodCount sessions" -ValueColor Green
-        Write-KV "Poor (<50% HW)" "$poorCount sessions" -ValueColor $(if ($poorCount -gt 0) { 'Red' } else { 'Green' })
-
-        $global:gradeData['sleepDrips'] = $avgHw
-
-        if ($avgHw -lt 50) {
-            $global:recommendations += @{ Severity='Warning'; Text="Average HW DRIPS is low ($avgHw%). Run 'powercfg /energy' to identify power efficiency issues." }
-        }
-
-        Write-Both "" -Color Gray
-        Write-Both "  Thresholds: >95% Excellent | 80-95% Good | 50-80% Mediocre | <50% Poor" -Color Gray
-        Write-Both "" -Color Gray
-        Write-Both "  Recent sleep sessions:" -Color Gray
-        Write-Both "    Date/Time             Duration   SW DRIPS   HW DRIPS   Exit Reason" -Color Gray
-        Write-Both "    --------------------  ---------  ---------  ---------  -----------" -Color Gray
-
-        foreach ($r in ($results | Select-Object -First 10)) {
-            $c = if ($r.HwDrips -ge 80) { [ConsoleColor]::Green }
-                 elseif ($r.HwDrips -ge 50) { [ConsoleColor]::Yellow }
-                 else { [ConsoleColor]::Red }
-            $durStr = if ($r.DurationMin -ge 60) { "$([math]::Round($r.DurationMin/60,1))h" } else { "$($r.DurationMin)m" }
-            $exit = if ($r.ExitReason) { $r.ExitReason } else { "-" }
-            if ($exit.Length -gt 20) { $exit = $exit.Substring(0, 20) }
-            $line = "    $($r.Time.PadRight(22))  $($durStr.PadRight(9))  $("$($r.SwDrips)%".PadRight(9))  $("$($r.HwDrips)%".PadRight(9))  $exit"
-            Write-Both $line -Color $c
-        }
-    } catch { Write-Both "  Could not retrieve sleep data: $_" -Color Yellow }
-}
-
-# --- 6. Boot Performance ---
-function Run-BootPerf {
-    Write-Header "BOOT PERFORMANCE"
+    # -- Boot Timing --
     try {
         if (-not $global:os) { $global:os = Get-CimInstance Win32_OperatingSystem }
         $lastBootTime = $global:os.LastBootUpTime
@@ -591,109 +390,96 @@ function Run-BootPerf {
                              elseif ($bootSec -lt 120) { [ConsoleColor]::Yellow }
                              else { [ConsoleColor]::Red }
                 Write-KV "Boot Duration" "$bootSec seconds" -ValueColor $bootColor
-                if ($data['MainPathBootTime']) { Write-KV "  Main Path" "$([math]::Round([int]$data['MainPathBootTime']/1000,1))s" }
-                if ($data['BootPostBootTime']) { Write-KV "  Post-Boot" "$([math]::Round([int]$data['BootPostBootTime']/1000,1))s" }
 
                 $global:gradeData['bootTimeSec'] = $bootSec
                 if ($bootSec -gt 120) {
                     $global:recommendations += @{ Severity='Warning'; Text="Boot time is $bootSec seconds. Consider disabling unnecessary startup items in Task Manager > Startup." }
                 }
             }
-        } else { Write-Both "  Boot duration data not available." -Color Yellow }
+        }
     } catch { Write-Both "  Could not retrieve boot performance: $_" -Color Yellow }
-}
 
-# --- 7. Boot Degradation Details ---
-function Run-BootDegrade {
-    Write-Header "BOOT DEGRADATION DETAILS"
+    # -- Boot Degradation --
     try {
         $degradeEvents = Get-WinEvent -FilterHashtable @{
             LogName='Microsoft-Windows-Diagnostics-Performance/Operational'; Id=101
         } -MaxEvents 10 -ErrorAction SilentlyContinue
 
-        if (-not $degradeEvents) {
-            Write-Both "  No boot degradation events found (good!)." -Color Green
-            return
-        }
-
-        Write-Both "  Processes that slowed recent boots:" -Color Gray
-        Write-Both "    Process                          Delay      File" -Color Gray
-        Write-Both "    -------------------------------- ---------- ----" -Color Gray
-
-        $seen = @{}
-        foreach ($evt in $degradeEvents) {
-            $xml = [xml]$evt.ToXml()
-            $data = @{}
-            $xml.Event.EventData.Data | ForEach-Object { if ($_.Name) { $data[$_.Name] = $_.'#text' } }
-
-            $name = $data['Name']
-            $file = $data['FileName']
-            $degradeMs = if ($data['DegradationTime']) { [long]$data['DegradationTime'] } else { 0 }
-
-            if (-not $name -or $seen.ContainsKey($name)) { continue }
-            $seen[$name] = $true
-
-            $degradeSec = [math]::Round($degradeMs / 1000, 1)
-            $c = if ($degradeSec -ge 10) { [ConsoleColor]::Red }
-                 elseif ($degradeSec -ge 5) { [ConsoleColor]::Yellow }
-                 else { [ConsoleColor]::White }
-
-            $displayName = if ($name.Length -gt 32) { $name.Substring(0, 32) } else { $name }
-            $displayFile = if ($file) { Split-Path $file -Leaf } else { "-" }
-            Write-Both "    $($displayName.PadRight(33)) ${degradeSec}s".PadRight(44) + "  $displayFile" -Color $c
-
-            if ($degradeSec -ge 10) {
-                $global:recommendations += @{ Severity='Info'; Text="'$name' adds ${degradeSec}s to boot time. Consider disabling it from startup if not essential." }
+        if ($degradeEvents) {
+            Write-Both "" -Color Gray
+            Write-Both "  Processes that slowed boot:" -Color Gray
+            $seen = @{}
+            foreach ($evt in ($degradeEvents | Select-Object -First 5)) {
+                $xml = [xml]$evt.ToXml()
+                $data = @{}
+                $xml.Event.EventData.Data | ForEach-Object { if ($_.Name) { $data[$_.Name] = $_.'#text' } }
+                $name = $data['Name']
+                $degradeMs = if ($data['DegradationTime']) { [long]$data['DegradationTime'] } else { 0 }
+                if (-not $name -or $seen.ContainsKey($name)) { continue }
+                $seen[$name] = $true
+                $degradeSec = [math]::Round($degradeMs / 1000, 1)
+                $c = if ($degradeSec -ge 10) { [ConsoleColor]::Red } elseif ($degradeSec -ge 5) { [ConsoleColor]::Yellow } else { [ConsoleColor]::White }
+                $displayName = if ($name.Length -gt 32) { $name.Substring(0, 32) } else { $name }
+                Write-Both "    $($displayName.PadRight(33)) +${degradeSec}s" -Color $c
+                if ($degradeSec -ge 10) {
+                    $global:recommendations += @{ Severity='Info'; Text="'$name' adds ${degradeSec}s to boot time. Consider disabling it from startup if not essential." }
+                }
             }
         }
-    } catch { Write-Both "  Could not retrieve boot degradation data: $_" -Color Yellow }
-}
+    } catch {}
 
-# --- 8. Shutdown Performance ---
-function Run-ShutdownPerf {
-    Write-Header "SHUTDOWN PERFORMANCE"
+    # -- Last Shutdown --
     try {
+        Write-Both "" -Color Gray
+        $shutdownEvents = Get-WinEvent -FilterHashtable @{
+            LogName='System'; Id=1074,6005,6006,6008
+        } -MaxEvents 30 -ErrorAction SilentlyContinue
+
+        $powerEvents = Get-WinEvent -FilterHashtable @{
+            LogName='System'; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41,42,107
+        } -MaxEvents 20 -ErrorAction SilentlyContinue
+
+        $allEvents = @()
+        if ($shutdownEvents) { $allEvents += $shutdownEvents }
+        if ($powerEvents) { $allEvents += $powerEvents }
+        $allEvents = $allEvents | Sort-Object TimeCreated -Descending
+
+        $lastBoot = $allEvents | Where-Object { $_.Id -eq 6005 } | Select-Object -First 1
+        $shutdownType = "Unknown"; $shutdownColor = [ConsoleColor]::Yellow
+
+        if ($lastBoot) {
+            $preBoot = $allEvents | Where-Object { $_.TimeCreated -lt $lastBoot.TimeCreated } | Select-Object -First 5
+            foreach ($evt in $preBoot) {
+                if ($evt.Id -eq 1074) {
+                    $shutdownType = if ($evt.Message -match 'restart') { "Clean restart" } else { "Clean shutdown" }
+                    $shutdownColor = [ConsoleColor]::Green; break
+                }
+                elseif ($evt.Id -eq 6008) { $shutdownType = "UNEXPECTED (dirty/crash)"; $shutdownColor = [ConsoleColor]::Red; break }
+                elseif ($evt.Id -eq 41)   { $shutdownType = "CRASH / POWER LOSS"; $shutdownColor = [ConsoleColor]::Red; break }
+                elseif ($evt.Id -eq 6006) { $shutdownType = "Clean shutdown"; $shutdownColor = [ConsoleColor]::Green; break }
+                elseif ($evt.Id -eq 42)   { $shutdownType = "Sleep / Hibernate"; $shutdownColor = [ConsoleColor]::Cyan; break }
+            }
+        }
+        Write-KV "Last Shutdown" $shutdownType -ValueColor $shutdownColor
+
+        # Shutdown duration
         $sdPerf = Get-WinEvent -FilterHashtable @{
             LogName='Microsoft-Windows-Diagnostics-Performance/Operational'; Id=200
         } -MaxEvents 1 -ErrorAction SilentlyContinue
-
         if ($sdPerf) {
             $xml = [xml]$sdPerf.ToXml()
             $data = @{}
             $xml.Event.EventData.Data | ForEach-Object { if ($_.Name) { $data[$_.Name] = $_.'#text' } }
             if ($data['ShutdownTime']) {
                 $sdSec = [math]::Round([int]$data['ShutdownTime'] / 1000, 1)
-                $sdColor = if ($sdSec -lt 30) { [ConsoleColor]::Green }
-                           elseif ($sdSec -lt 60) { [ConsoleColor]::Yellow }
-                           else { [ConsoleColor]::Red }
-                Write-KV "Last Shutdown Time" "$sdSec seconds" -ValueColor $sdColor
+                $sdColor = if ($sdSec -lt 30) { [ConsoleColor]::Green } elseif ($sdSec -lt 60) { [ConsoleColor]::Yellow } else { [ConsoleColor]::Red }
+                Write-KV "Shutdown Duration" "$sdSec seconds" -ValueColor $sdColor
             }
         }
-
-        $sdDegrade = Get-WinEvent -FilterHashtable @{
-            LogName='Microsoft-Windows-Diagnostics-Performance/Operational'; Id=203
-        } -MaxEvents 10 -ErrorAction SilentlyContinue
-
-        if ($sdDegrade) {
-            Write-Both "  Services that delayed shutdown:" -Color Gray
-            foreach ($evt in ($sdDegrade | Select-Object -First 5)) {
-                $xml = [xml]$evt.ToXml()
-                $data = @{}
-                $xml.Event.EventData.Data | ForEach-Object { if ($_.Name) { $data[$_.Name] = $_.'#text' } }
-                $name = $data['Name']; $file = $data['FileName']
-                $degradeMs = if ($data['DegradationTime']) { [long]$data['DegradationTime'] } else { 0 }
-                $degradeSec = [math]::Round($degradeMs / 1000, 1)
-                $displayName = if ($name) { $name } elseif ($file) { Split-Path $file -Leaf } else { "Unknown" }
-                $c = if ($degradeSec -ge 10) { [ConsoleColor]::Red } elseif ($degradeSec -ge 5) { [ConsoleColor]::Yellow } else { [ConsoleColor]::White }
-                Write-Both "    $($displayName.PadRight(40)) +${degradeSec}s" -Color $c
-            }
-        } else {
-            Write-Both "  No shutdown delay data found." -Color Green
-        }
-    } catch { Write-Both "  Could not retrieve shutdown performance: $_" -Color Yellow }
+    } catch { Write-Both "  Could not query shutdown events: $_" -Color Yellow }
 }
 
-# --- 9. App Crashes & Hangs ---
+# --- 4. App Crashes & Hangs ---
 function Run-Crashes {
     Write-Header "APPLICATION CRASHES & HANGS"
     try {
@@ -858,64 +644,7 @@ function Run-Disk {
     } catch { Write-Both "  Could not retrieve disk info: $_" -Color Yellow }
 }
 
-# --- 12. Windows Update Health ---
-function Run-Updates {
-    Write-Header "WINDOWS UPDATE HEALTH"
-    try {
-        $updateFails = Get-WinEvent -FilterHashtable @{
-            LogName='System'; ProviderName='Microsoft-Windows-WindowsUpdateClient'; Level=2,3
-        } -MaxEvents 15 -ErrorAction SilentlyContinue
-
-        $failCount = if ($updateFails) { $updateFails.Count } else { 0 }
-        $global:gradeData['updateFailures'] = $failCount
-
-        if ($updateFails) {
-            $failColor = if ($updateFails.Count -ge 10) { [ConsoleColor]::Red }
-                         elseif ($updateFails.Count -ge 3) { [ConsoleColor]::Yellow }
-                         else { [ConsoleColor]::White }
-            Write-KV "Failed Updates" "$($updateFails.Count) events" -ValueColor $failColor
-            Write-Both "" -Color Gray
-            Write-Both "  Recent failures:" -Color Gray
-            $seen = @{}
-            foreach ($evt in ($updateFails | Select-Object -First 10)) {
-                $msg = $evt.Message
-                $short = if ($msg.Length -gt 90) { $msg.Substring(0, 90) + "..." } else { $msg }
-                $key = $short
-                if ($seen.ContainsKey($key)) { continue }
-                $seen[$key] = $true
-                $date = $evt.TimeCreated.ToString("yyyy-MM-dd HH:mm")
-                Write-Both "    $date  $short" -Color Yellow
-            }
-            $global:recommendations += @{ Severity='Info'; Text="$failCount update failure(s) found. Run Windows Update Troubleshooter: Settings > System > Troubleshoot > Windows Update." }
-        } else {
-            Write-Both "  No update failures found." -Color Green
-        }
-    } catch { Write-Both "  Could not retrieve update data: $_" -Color Yellow }
-}
-
-# --- 13. Startup Programs ---
-function Run-Startup {
-    Write-Header "STARTUP PROGRAMS"
-    try {
-        $startups = Get-CimInstance Win32_StartupCommand -ErrorAction SilentlyContinue
-        if ($startups) {
-            Write-KV "Startup Items" "$($startups.Count) programs"
-            Write-Both "" -Color Gray
-            foreach ($s in $startups) {
-                $name = if ($s.Name) { $s.Name } else { "Unknown" }
-                $loc = if ($s.Location) { $s.Location } else { "" }
-                if ($name.Length -gt 35) { $name = $name.Substring(0, 35) + "..." }
-                Write-Both "    $($name.PadRight(38))  [$loc]" -Color White
-            }
-            Write-Both "" -Color Gray
-            Write-Both "  Tip: Disable unnecessary startup items in Task Manager > Startup" -Color Gray
-        } else {
-            Write-Both "  No startup programs found." -Color Green
-        }
-    } catch { Write-Both "  Could not retrieve startup programs: $_" -Color Yellow }
-}
-
-# --- 14. Network Adapters ---
+# --- 5. Network Adapters ---
 function Run-Network {
     Write-Header "NETWORK ADAPTERS"
     try {
@@ -941,73 +670,97 @@ function Run-Network {
     } catch { Write-Both "  Could not retrieve network info: $_" -Color Yellow }
 }
 
-# --- 15. GPU / Display ---
-function Run-GPU {
-    Write-Header "GPU / DISPLAY"
+# ============================================================
+# Silent Data Collectors (scorecard only, no output)
+# ============================================================
+
+function Run-SilentCollectors {
+    # -- Sleep / DRIPS --
+    try {
+        $xmlPath = Join-Path $env:TEMP "SHR_sleepstudy_$([System.IO.Path]::GetRandomFileName()).xml"
+        $null = & powercfg /sleepstudy /output $xmlPath /xml /duration 7 2>&1
+        if (Test-Path $xmlPath) {
+            $xmlSettings = New-Object System.Xml.XmlReaderSettings
+            $xmlSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+            $xmlSettings.XmlResolver = $null
+            $reader = [System.Xml.XmlReader]::Create($xmlPath, $xmlSettings)
+            $xmlData = New-Object System.Xml.XmlDocument
+            $xmlData.Load($reader)
+            $reader.Close()
+            Remove-Item $xmlPath -Force -ErrorAction SilentlyContinue
+
+            $ns = @{ss='http://schemas.microsoft.com/sleepstudy/2012'}
+            $sessions = Select-Xml -Xml $xmlData -Namespace $ns -XPath '//ss:OsStateInstance[@Type="Sleep"]'
+            if ($sessions -and $sessions.Count -gt 0) {
+                $hwValues = @()
+                foreach ($s in $sessions) {
+                    $node = $s.Node
+                    $durTicks = [long]$node.Duration
+                    $durUs = $durTicks / 10
+                    if ($durUs -le 0) { continue }
+                    $durMin = [math]::Round($durUs / 1000000 / 60, 1)
+                    if ($durMin -lt 10) { continue }
+                    $records = $node.CustomData.OSStateCustomData.OSStateRecord
+                    $hwDrips = 0
+                    foreach ($r in $records) { if ($r.Name -eq 'HW DRIPS Time') { $hwDrips = [long]$r.Value } }
+                    $hwValues += [math]::Round(($hwDrips / $durUs) * 100, 1)
+                }
+                if ($hwValues.Count -gt 0) {
+                    $avgHw = [math]::Round(($hwValues | Measure-Object -Average).Average, 1)
+                    $global:gradeData['sleepDrips'] = $avgHw
+                    if ($avgHw -lt 50) {
+                        $global:recommendations += @{ Severity='Warning'; Text="Average HW DRIPS is low ($avgHw%). Run 'powercfg /energy' to identify power efficiency issues." }
+                    }
+                }
+            }
+        }
+    } catch {}
+
+    # -- Windows Updates --
+    try {
+        $updateFails = Get-WinEvent -FilterHashtable @{
+            LogName='System'; ProviderName='Microsoft-Windows-WindowsUpdateClient'; Level=2,3
+        } -MaxEvents 15 -ErrorAction SilentlyContinue
+        $failCount = if ($updateFails) { $updateFails.Count } else { 0 }
+        $global:gradeData['updateFailures'] = $failCount
+        if ($failCount -gt 0) {
+            $global:recommendations += @{ Severity='Info'; Text="$failCount update failure(s) found. Run Windows Update Troubleshooter: Settings > System > Troubleshoot > Windows Update." }
+        }
+    } catch {}
+
+    # -- GPU --
     try {
         $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
         $global:gradeData['gpuOk'] = $true
         if ($gpus) {
             foreach ($g in $gpus) {
-                $vramMB = [math]::Round($g.AdapterRAM / 1MB, 0)
-                $driverDate = if ($g.DriverDate) { $g.DriverDate.ToString("yyyy-MM-dd") } else { "Unknown" }
-                Write-KV "  $($g.Name)" "$($g.Status)" -ValueColor $(if ($g.Status -eq 'OK') { 'Green' } else { 'Yellow' })
-                Write-KV "    Driver Version" $g.DriverVersion
-                Write-KV "    Driver Date" $driverDate
-                Write-KV "    VRAM" "$(if ($vramMB -gt 0) { "${vramMB} MB" } else { 'N/A (shared)' })"
-                Write-KV "    Resolution" "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
-
                 if ($g.Status -ne 'OK') {
                     $global:gradeData['gpuOk'] = $false
                     $global:recommendations += @{ Severity='Warning'; Text="GPU '$($g.Name)' reports status '$($g.Status)'. Update or reinstall graphics drivers." }
                 }
             }
-        } else {
-            Write-Both "  No GPU information available." -Color Yellow
         }
-    } catch { Write-Both "  Could not retrieve GPU info: $_" -Color Yellow }
-}
+    } catch {}
 
-# --- 16. Battery Health ---
-function Run-Battery {
-    Write-Header "BATTERY HEALTH"
+    # -- Battery --
     try {
         $battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
-        if (-not $battery) {
-            Write-Both "  No battery detected (desktop system)." -Color Gray
-            return
-        }
-        Write-KV "Status" $battery.Status -ValueColor $(if ($battery.Status -eq 'OK') { 'Green' } else { 'Yellow' })
-        Write-KV "Charge" "$($battery.EstimatedChargeRemaining)%"
-
-        # Try to get design vs full capacity
-        try {
-            $static = Get-CimInstance -Namespace root/WMI -ClassName BatteryStaticData -ErrorAction Stop
-            $full = Get-CimInstance -Namespace root/WMI -ClassName BatteryFullChargedCapacity -ErrorAction Stop
-            if ($static -and $full -and $static.DesignedCapacity -gt 0) {
-                $designCap = $static.DesignedCapacity
-                $fullCap = $full.FullChargedCapacity
-                $wearPct = [math]::Round((1 - $fullCap / $designCap) * 100, 1)
-                $wearColor = if ($wearPct -lt 20) { [ConsoleColor]::Green }
-                             elseif ($wearPct -lt 50) { [ConsoleColor]::Yellow }
-                             else { [ConsoleColor]::Red }
-                Write-KV "Design Capacity" "$designCap mWh"
-                Write-KV "Current Capacity" "$fullCap mWh"
-                Write-KV "Wear Level" "$wearPct%" -ValueColor $wearColor
-                $global:gradeData['batteryWear'] = $wearPct
-                if ($wearPct -ge 80) {
-                    $global:recommendations += @{ Severity='Critical'; Text="Battery is severely degraded ($wearPct% wear). Replace battery." }
-                } elseif ($wearPct -ge 50) {
-                    $global:recommendations += @{ Severity='Warning'; Text="Battery has $wearPct% wear. Consider replacement soon." }
+        if ($battery) {
+            try {
+                $static = Get-CimInstance -Namespace root/WMI -ClassName BatteryStaticData -ErrorAction Stop
+                $full = Get-CimInstance -Namespace root/WMI -ClassName BatteryFullChargedCapacity -ErrorAction Stop
+                if ($static -and $full -and $static.DesignedCapacity -gt 0) {
+                    $wearPct = [math]::Round((1 - $full.FullChargedCapacity / $static.DesignedCapacity) * 100, 1)
+                    $global:gradeData['batteryWear'] = $wearPct
+                    if ($wearPct -ge 80) {
+                        $global:recommendations += @{ Severity='Critical'; Text="Battery is severely degraded ($wearPct% wear). Replace battery." }
+                    } elseif ($wearPct -ge 50) {
+                        $global:recommendations += @{ Severity='Warning'; Text="Battery has $wearPct% wear. Consider replacement soon." }
+                    }
                 }
-            }
-        } catch {}
-
-        try {
-            $cycle = Get-CimInstance -Namespace root/WMI -ClassName BatteryCycleCount -ErrorAction Stop
-            if ($cycle) { Write-KV "Cycle Count" $cycle.CycleCount }
-        } catch {}
-    } catch { Write-Both "  Could not retrieve battery info: $_" -Color Yellow }
+            } catch {}
+        }
+    } catch {}
 }
 
 # ============================================================
@@ -1510,22 +1263,13 @@ $global:enabledTotal = ($global:sections.Values | Where-Object { $_.Enabled }).C
 
 # Section dispatch table
 $sectionFunctions = [ordered]@{
-    'sysinfo'       = { Run-SysInfo }
-    'stability'     = { Run-Stability }
-    'bsod'          = { Run-BSOD }
-    'shutdown'      = { Run-Shutdown }
-    'sleep'         = { Run-Sleep }
-    'bootperf'      = { Run-BootPerf }
-    'bootdegrade'   = { Run-BootDegrade }
-    'shutdownperf'  = { Run-ShutdownPerf }
-    'crashes'       = { Run-Crashes }
-    'memory'        = { Run-Memory }
-    'disk'          = { Run-Disk }
-    'updates'       = { Run-Updates }
-    'startup'       = { Run-Startup }
-    'network'       = { Run-Network }
-    'gpu'           = { Run-GPU }
-    'battery'       = { Run-Battery }
+    'sysinfo'    = { Run-SysInfo }
+    'stability'  = { Run-StabilityAndBSOD }
+    'boot'       = { Run-BootAndShutdown }
+    'memory'     = { Run-Memory }
+    'disk'       = { Run-Disk }
+    'crashes'    = { Run-Crashes }
+    'network'    = { Run-Network }
 }
 
 # Run selected sections with progress and timing
@@ -1544,6 +1288,9 @@ foreach ($key in $sectionFunctions.Keys) {
 
     Write-Host "  (completed in ${elapsed}s)" -ForegroundColor DarkGray
 }
+
+# Run silent data collectors for scorecard (sleep, updates, GPU, battery)
+Run-SilentCollectors
 
 # Calculate health grade
 $gradeResult = Get-HealthGrade
