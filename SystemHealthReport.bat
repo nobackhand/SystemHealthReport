@@ -502,6 +502,9 @@ function Run-Sleep {
             $hwPct = [math]::Round(($hwDrips / $durUs) * 100, 1)
             $durMin = [math]::Round($durUs / 1000000 / 60, 1)
 
+            # Skip short cycles (< 10 min) -- they produce misleading DRIPS scores
+            if ($durMin -lt 10) { continue }
+
             $results += [PSCustomObject]@{
                 Time = $node.LocalTimestamp
                 DurationMin = $durMin
@@ -532,6 +535,8 @@ function Run-Sleep {
         Write-KV "Avg HW DRIPS" "$avgHw%" -ValueColor $avgColor
         Write-KV "Good (>80% HW)" "$goodCount sessions" -ValueColor Green
         Write-KV "Poor (<50% HW)" "$poorCount sessions" -ValueColor $(if ($poorCount -gt 0) { 'Red' } else { 'Green' })
+
+        $global:gradeData['sleepDrips'] = $avgHw
 
         if ($avgHw -lt 50) {
             $global:recommendations += @{ Severity='Warning'; Text="Average HW DRIPS is low ($avgHw%). Run 'powercfg /energy' to identify power efficiency issues." }
@@ -915,7 +920,10 @@ function Run-Network {
     Write-Header "NETWORK ADAPTERS"
     try {
         $adapters = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -ne 'Not Present' }
+        $global:gradeData['networkOk'] = $true
         if ($adapters) {
+            $anyUp = ($adapters | Where-Object { $_.Status -eq 'Up' }).Count -gt 0
+            $global:gradeData['networkOk'] = $anyUp
             foreach ($a in $adapters) {
                 $statusColor = if ($a.Status -eq 'Up') { [ConsoleColor]::Green }
                                elseif ($a.Status -eq 'Disconnected') { [ConsoleColor]::Yellow }
@@ -938,6 +946,7 @@ function Run-GPU {
     Write-Header "GPU / DISPLAY"
     try {
         $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
+        $global:gradeData['gpuOk'] = $true
         if ($gpus) {
             foreach ($g in $gpus) {
                 $vramMB = [math]::Round($g.AdapterRAM / 1MB, 0)
@@ -949,6 +958,7 @@ function Run-GPU {
                 Write-KV "    Resolution" "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
 
                 if ($g.Status -ne 'OK') {
+                    $global:gradeData['gpuOk'] = $false
                     $global:recommendations += @{ Severity='Warning'; Text="GPU '$($g.Name)' reports status '$($g.Status)'. Update or reinstall graphics drivers." }
                 }
             }
@@ -1049,7 +1059,14 @@ function Get-HealthGrade {
     return @{ Score = $score; Grade = $grade }
 }
 
-function Show-GradeAscii {
+function Get-MiniBar {
+    param([double]$Percent, [int]$Width = 10)
+    $filled = [math]::Min($Width, [math]::Max(0, [math]::Round($Percent / 100 * $Width)))
+    $empty = $Width - $filled
+    return "[" + ("#" * $filled) + ("-" * $empty) + "]"
+}
+
+function Show-Scorecard {
     param([string]$Grade, [int]$Score)
 
     $gradeColor = switch ($Grade) {
@@ -1061,50 +1078,107 @@ function Show-GradeAscii {
         default { [ConsoleColor]::White }
     }
 
-    $art = switch ($Grade) {
-        'A' { @(
-            "     AAA     ",
-            "    A   A    ",
-            "    AAAAA    ",
-            "    A   A    ",
-            "    A   A    "
-        )}
-        'B' { @(
-            "    BBBB     ",
-            "    B   B    ",
-            "    BBBB     ",
-            "    B   B    ",
-            "    BBBB     "
-        )}
-        'C' { @(
-            "     CCCC    ",
-            "    C        ",
-            "    C        ",
-            "    C        ",
-            "     CCCC    "
-        )}
-        'D' { @(
-            "    DDDD     ",
-            "    D   D    ",
-            "    D   D    ",
-            "    D   D    ",
-            "    DDDD     "
-        )}
-        'F' { @(
-            "    FFFFF    ",
-            "    F        ",
-            "    FFFF     ",
-            "    F        ",
-            "    F        "
-        )}
+    Write-Both "" -Color Cyan
+    Write-Both "========================================================" -Color Cyan
+    Write-Both "    SYSTEM HEALTH SCORECARD          Grade: $Grade ($Score/100)" -Color $gradeColor
+    Write-Both "========================================================" -Color Cyan
+
+    # Build scorecard rows from gradeData
+    $rows = @()
+
+    # Stability
+    $stab = if ($global:gradeData.ContainsKey('stability')) { $global:gradeData['stability'] } else { $null }
+    if ($null -ne $stab) {
+        $stabRound = [math]::Round($stab, 1)
+        $stabPct = $stab * 10
+        $stabStatus = if ($stab -ge 8) { 'OK' } elseif ($stab -ge 5) { 'WARN' } else { 'FAIL' }
+        $rows += @{ Name='Stability'; Value="$stabRound/10"; Pct=$stabPct; Status=$stabStatus }
     }
 
-    Write-Both "" -Color $gradeColor
-    Write-Both "  Overall Health Grade: $Grade ($Score/100)" -Color $gradeColor
-    foreach ($line in $art) {
-        Write-Both "  $line" -Color $gradeColor
+    # BSODs
+    $bsods = if ($global:gradeData.ContainsKey('bsodCount')) { $global:gradeData['bsodCount'] } else { 0 }
+    $bsodStatus = if ($bsods -eq 0) { 'OK' } elseif ($bsods -le 2) { 'WARN' } else { 'FAIL' }
+    $bsodPct = if ($bsods -eq 0) { 100 } elseif ($bsods -le 2) { 60 } else { 10 }
+    $rows += @{ Name='BSODs'; Value="$bsods"; Pct=$bsodPct; Status=$bsodStatus }
+
+    # Boot Time
+    $boot = if ($global:gradeData.ContainsKey('bootTimeSec')) { $global:gradeData['bootTimeSec'] } else { $null }
+    if ($null -ne $boot) {
+        $bootStatus = if ($boot -lt 60) { 'OK' } elseif ($boot -lt 120) { 'WARN' } else { 'FAIL' }
+        $bootPct = [math]::Max(0, [math]::Min(100, 100 - ($boot / 1.8)))
+        $rows += @{ Name='Boot Time'; Value="${boot}s"; Pct=$bootPct; Status=$bootStatus }
     }
-    Write-Both "" -Color $gradeColor
+
+    # Memory
+    $mem = if ($global:gradeData.ContainsKey('memoryPct')) { $global:gradeData['memoryPct'] } else { $null }
+    if ($null -ne $mem) {
+        $memStatus = if ($mem -lt 70) { 'OK' } elseif ($mem -lt 90) { 'WARN' } else { 'FAIL' }
+        $memPct = 100 - $mem
+        $rows += @{ Name='Memory'; Value="$mem% used"; Pct=$memPct; Status=$memStatus }
+    }
+
+    # Disk Health
+    $diskOk = if ($global:gradeData.ContainsKey('diskHealthy')) { $global:gradeData['diskHealthy'] } else { $true }
+    $diskStatus = if ($diskOk) { 'OK' } else { 'FAIL' }
+    $rows += @{ Name='Disk Health'; Value=$(if ($diskOk) { 'Healthy' } else { 'UNHEALTHY' }); Pct=$(if ($diskOk) { 100 } else { 0 }); Status=$diskStatus }
+
+    # Disk Space
+    $diskPct = if ($global:gradeData.ContainsKey('diskMaxPct')) { $global:gradeData['diskMaxPct'] } else { $null }
+    if ($null -ne $diskPct) {
+        $diskSpStatus = if ($diskPct -lt 80) { 'OK' } elseif ($diskPct -lt 90) { 'WARN' } else { 'FAIL' }
+        $rows += @{ Name='Disk Space'; Value="$diskPct% used"; Pct=(100 - $diskPct); Status=$diskSpStatus }
+    }
+
+    # Crashes
+    $crashes = if ($global:gradeData.ContainsKey('crashCount')) { $global:gradeData['crashCount'] } else { 0 }
+    $crashStatus = if ($crashes -eq 0) { 'OK' } elseif ($crashes -le 5) { 'WARN' } else { 'FAIL' }
+    $crashPct = if ($crashes -eq 0) { 100 } elseif ($crashes -le 5) { 60 } else { 10 }
+    $rows += @{ Name='Crashes'; Value="$crashes"; Pct=$crashPct; Status=$crashStatus }
+
+    # Updates
+    $uf = if ($global:gradeData.ContainsKey('updateFailures')) { $global:gradeData['updateFailures'] } else { 0 }
+    $ufStatus = if ($uf -eq 0) { 'OK' } elseif ($uf -lt 5) { 'WARN' } else { 'FAIL' }
+    $rows += @{ Name='Updates'; Value=$(if ($uf -eq 0) { 'OK' } else { "$uf failures" }); Pct=$(if ($uf -eq 0) { 100 } else { 40 }); Status=$ufStatus }
+
+    # Network
+    $netOk = if ($global:gradeData.ContainsKey('networkOk')) { $global:gradeData['networkOk'] } else { $true }
+    $rows += @{ Name='Network'; Value=$(if ($netOk) { 'Connected' } else { 'DOWN' }); Pct=$(if ($netOk) { 100 } else { 0 }); Status=$(if ($netOk) { 'OK' } else { 'FAIL' }) }
+
+    # GPU
+    $gpuOk = if ($global:gradeData.ContainsKey('gpuOk')) { $global:gradeData['gpuOk'] } else { $true }
+    $rows += @{ Name='GPU'; Value=$(if ($gpuOk) { 'OK' } else { 'Issue' }); Pct=$(if ($gpuOk) { 100 } else { 30 }); Status=$(if ($gpuOk) { 'OK' } else { 'WARN' }) }
+
+    # Sleep DRIPS
+    $drips = if ($global:gradeData.ContainsKey('sleepDrips')) { $global:gradeData['sleepDrips'] } else { $null }
+    if ($null -ne $drips) {
+        $dripsStatus = if ($drips -ge 80) { 'OK' } elseif ($drips -ge 50) { 'WARN' } else { 'FAIL' }
+        $rows += @{ Name='Sleep DRIPS'; Value="$drips%"; Pct=$drips; Status=$dripsStatus }
+    }
+
+    # Battery
+    $battWear = if ($global:gradeData.ContainsKey('batteryWear')) { $global:gradeData['batteryWear'] } else { $null }
+    if ($null -ne $battWear) {
+        $battStatus = if ($battWear -lt 20) { 'OK' } elseif ($battWear -lt 50) { 'WARN' } else { 'FAIL' }
+        $rows += @{ Name='Battery'; Value="$battWear% wear"; Pct=(100 - $battWear); Status=$battStatus }
+    }
+
+    # Render rows
+    foreach ($r in $rows) {
+        $nameStr = "  $($r.Name)".PadRight(16)
+        $valStr = "$($r.Value)".PadRight(14)
+        $bar = Get-MiniBar -Percent $r.Pct
+        $statusStr = $r.Status
+        $color = switch ($r.Status) {
+            'OK'   { [ConsoleColor]::Green }
+            'WARN' { [ConsoleColor]::Yellow }
+            'FAIL' { [ConsoleColor]::Red }
+            default { [ConsoleColor]::White }
+        }
+        Write-Both "$nameStr $valStr $bar  $statusStr" -Color $color
+    }
+
+    Write-Both "========================================================" -Color Cyan
+    Write-Both "" -Color Gray
 }
 
 # ============================================================
@@ -1261,6 +1335,35 @@ function Generate-HtmlReport {
         default { '#9ca3af' }
     }
 
+    # Build scorecard HTML
+    $scorecardRows = @()
+    $scFields = @(
+        @{ Key='stability'; Name='Stability'; Fmt={ param($v) "$([math]::Round($v,1))/10" }; PctFn={ param($v) $v*10 }; StatusFn={ param($v) if($v -ge 8){'OK'}elseif($v -ge 5){'WARN'}else{'FAIL'} } }
+        @{ Key='bsodCount'; Name='BSODs'; Fmt={ param($v) "$v" }; PctFn={ param($v) if($v -eq 0){100}elseif($v -le 2){60}else{10} }; StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -le 2){'WARN'}else{'FAIL'} } }
+        @{ Key='bootTimeSec'; Name='Boot Time'; Fmt={ param($v) "${v}s" }; PctFn={ param($v) [math]::Max(0,[math]::Min(100,100-($v/1.8))) }; StatusFn={ param($v) if($v -lt 60){'OK'}elseif($v -lt 120){'WARN'}else{'FAIL'} } }
+        @{ Key='memoryPct'; Name='Memory'; Fmt={ param($v) "$v% used" }; PctFn={ param($v) 100-$v }; StatusFn={ param($v) if($v -lt 70){'OK'}elseif($v -lt 90){'WARN'}else{'FAIL'} } }
+        @{ Key='diskHealthy'; Name='Disk Health'; Fmt={ param($v) if($v){'Healthy'}else{'UNHEALTHY'} }; PctFn={ param($v) if($v){100}else{0} }; StatusFn={ param($v) if($v){'OK'}else{'FAIL'} } }
+        @{ Key='diskMaxPct'; Name='Disk Space'; Fmt={ param($v) "$v% used" }; PctFn={ param($v) 100-$v }; StatusFn={ param($v) if($v -lt 80){'OK'}elseif($v -lt 90){'WARN'}else{'FAIL'} } }
+        @{ Key='crashCount'; Name='Crashes'; Fmt={ param($v) "$v" }; PctFn={ param($v) if($v -eq 0){100}elseif($v -le 5){60}else{10} }; StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -le 5){'WARN'}else{'FAIL'} } }
+        @{ Key='updateFailures'; Name='Updates'; Fmt={ param($v) if($v -eq 0){'OK'}else{"$v failures"} }; PctFn={ param($v) if($v -eq 0){100}else{40} }; StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -lt 5){'WARN'}else{'FAIL'} } }
+        @{ Key='networkOk'; Name='Network'; Fmt={ param($v) if($v){'Connected'}else{'DOWN'} }; PctFn={ param($v) if($v){100}else{0} }; StatusFn={ param($v) if($v){'OK'}else{'FAIL'} } }
+        @{ Key='gpuOk'; Name='GPU'; Fmt={ param($v) if($v){'OK'}else{'Issue'} }; PctFn={ param($v) if($v){100}else{30} }; StatusFn={ param($v) if($v){'OK'}else{'WARN'} } }
+        @{ Key='sleepDrips'; Name='Sleep DRIPS'; Fmt={ param($v) "$v%" }; PctFn={ param($v) $v }; StatusFn={ param($v) if($v -ge 80){'OK'}elseif($v -ge 50){'WARN'}else{'FAIL'} } }
+        @{ Key='batteryWear'; Name='Battery'; Fmt={ param($v) "$v% wear" }; PctFn={ param($v) 100-$v }; StatusFn={ param($v) if($v -lt 20){'OK'}elseif($v -lt 50){'WARN'}else{'FAIL'} } }
+    )
+    foreach ($f in $scFields) {
+        if (-not $global:gradeData.ContainsKey($f.Key)) { continue }
+        $val = $global:gradeData[$f.Key]
+        if ($null -eq $val) { continue }
+        $dispVal = & $f.Fmt $val
+        $pct = & $f.PctFn $val
+        $status = & $f.StatusFn $val
+        $sColor = switch ($status) { 'OK' { '#22c55e' } 'WARN' { '#eab308' } 'FAIL' { '#ef4444' } default { '#9ca3af' } }
+        $barW = [math]::Max(0, [math]::Min(100, [math]::Round($pct)))
+        $scorecardRows += "<div class=`"sc-row`"><span class=`"sc-name`">$($f.Name)</span><span class=`"sc-val`" style=`"color:$sColor`">$([System.Net.WebUtility]::HtmlEncode($dispVal))</span><span class=`"sc-bar`"><span class=`"sc-fill`" style=`"width:${barW}%;background:$sColor`"></span></span><span class=`"sc-status`" style=`"color:$sColor`">$status</span></div>`n"
+    }
+    $scorecardHtml = $scorecardRows -join ""
+
     $recHtml = ""
     if ($global:recommendations.Count -gt 0) {
         $severityOrder = @{ 'Critical' = 0; 'Warning' = 1; 'Info' = 2 }
@@ -1335,6 +1438,15 @@ function Generate-HtmlReport {
   .footer { text-align: center; padding: 16px; color: var(--text-dim); font-size: 12px; border-top: 1px solid var(--border); margin-top: 20px; }
   .recs-section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 10px; }
   .recs-section h2 { color: #67e8f9; font-size: 14px; margin-bottom: 12px; }
+  .scorecard { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
+  .scorecard h2 { color: #67e8f9; font-size: 14px; margin-bottom: 12px; text-align: center; }
+  .sc-row { display: flex; align-items: center; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+  .sc-row:last-child { border-bottom: none; }
+  .sc-name { width: 110px; color: var(--text-dim); font-size: 12px; }
+  .sc-val { width: 100px; font-size: 12px; font-weight: bold; }
+  .sc-bar { flex: 1; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; margin: 0 12px; }
+  .sc-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
+  .sc-status { width: 50px; font-size: 11px; font-weight: bold; text-align: right; }
 </style>
 </head>
 <body>
@@ -1344,6 +1456,11 @@ function Generate-HtmlReport {
     <div class="date">Generated: $reportDateStr</div>
     <div class="grade-badge" style="background: $gradeColor;">$Grade</div>
     <div class="grade-score">Score: $Score / 100</div>
+  </div>
+
+  <div class="scorecard">
+    <h2>SCORECARD</h2>
+    $scorecardHtml
   </div>
 
   $sectionsBody
@@ -1433,7 +1550,7 @@ $gradeResult = Get-HealthGrade
 $healthGrade = $gradeResult.Grade
 $healthScore = $gradeResult.Score
 
-Show-GradeAscii -Grade $healthGrade -Score $healthScore
+Show-Scorecard -Grade $healthGrade -Score $healthScore
 
 # Show recommendations
 Show-Recommendations
