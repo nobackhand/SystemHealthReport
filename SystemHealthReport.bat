@@ -2,43 +2,102 @@
 @echo off & setlocal
 set "SHR_SCRIPT_DIR=%~dp0"
 set "SHR_SCRIPT_PATH=%~f0"
+set "SHR_ARGS=%*"
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrator privileges...
-    powershell -Command "Start-Process cmd -ArgumentList '/c',('\"'+$env:SHR_SCRIPT_PATH+'\"') -Verb RunAs"
+    powershell -Command "Start-Process cmd -ArgumentList '/c',('\"'+$env:SHR_SCRIPT_PATH+'\" '+$env:SHR_ARGS) -Verb RunAs"
     exit /b
 )
-powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((Get-Content -LiteralPath $env:SHR_SCRIPT_PATH -Raw)))"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((Get-Content -LiteralPath $env:SHR_SCRIPT_PATH -Raw))) $env:SHR_ARGS"
 pause
 exit /b
 #>
 
 # ============================================================
-# Windows System Health Report v2.0
+# Windows System Health Report v3.0
 # ============================================================
+
+param([Parameter(ValueFromRemainingArguments=$true)][string[]]$ScriptArgs)
 
 $ErrorActionPreference = 'Continue'
 $global:report = [System.Text.StringBuilder]::new()
+$global:htmlContent = [System.Text.StringBuilder]::new()
+$global:recommendations = @()
+$global:gradeData = @{}
+$global:sectionTimings = @{}
+$global:sectionIndex = 0
+$global:enabledTotal = 0
 
 $scriptDir = $env:SHR_SCRIPT_DIR
 if (-not $scriptDir) { $scriptDir = $PWD.Path }
 $reportFile = Join-Path $scriptDir "HealthReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+$htmlReportFile = Join-Path $scriptDir "HealthReport_$(Get-Date -Format 'yyyyMMdd_HHmmss').html"
+$historyFile = Join-Path $scriptDir "HealthHistory.json"
+
+# ============================================================
+# Parse Command-Line Arguments
+# ============================================================
+
+$cliAll = $false
+$cliQuiet = $false
+$cliClipboard = $false
+$cliHtml = $false
+$cliSections = @()
+$cliMode = $false
+
+if ($ScriptArgs) {
+    foreach ($arg in $ScriptArgs) {
+        switch -Wildcard ($arg.ToLower()) {
+            '/all'       { $cliAll = $true; $cliMode = $true }
+            '/quiet'     { $cliQuiet = $true; $cliMode = $true }
+            '/q'         { $cliQuiet = $true; $cliMode = $true }
+            '/clipboard' { $cliClipboard = $true; $cliMode = $true }
+            '/html'      { $cliHtml = $true; $cliMode = $true }
+            '/sections:*' {
+                $cliMode = $true
+                $parts = $arg.Substring(10) -split ','
+                $cliSections += $parts
+            }
+        }
+    }
+}
 
 # ============================================================
 # Helper Functions
 # ============================================================
+
+function Write-Html {
+    param([string]$Html)
+    [void]$global:htmlContent.AppendLine($Html)
+}
 
 function Write-Both {
     param([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::Gray, [switch]$NoNewline)
     if ($NoNewline) { Write-Host $Text -ForegroundColor $Color -NoNewline }
     else { Write-Host $Text -ForegroundColor $Color }
     [void]$global:report.AppendLine($Text)
+    $cssClass = switch ($Color) {
+        'Green'     { 'green' }
+        'Red'       { 'red' }
+        'Yellow'    { 'yellow' }
+        'Cyan'      { 'cyan' }
+        'DarkGray'  { 'darkgray' }
+        'White'     { 'white' }
+        'Gray'      { 'gray' }
+        'Magenta'   { 'magenta' }
+        default     { 'gray' }
+    }
+    $escaped = [System.Net.WebUtility]::HtmlEncode($Text)
+    Write-Html "<div class=`"line $cssClass`">$escaped</div>"
 }
 
 function Write-Header {
     param([string]$Title)
     $line = "-" * 58
     Write-Host ""
+    [void]$global:report.AppendLine("")
+    Write-Html "</details><details open><summary class=`"section-header`">$([System.Net.WebUtility]::HtmlEncode($Title))</summary>"
     Write-Both "--- $Title $($line.Substring(0, [math]::Max(0, 58 - $Title.Length - 5)))" -Color Cyan
 }
 
@@ -48,6 +107,18 @@ function Write-KV {
     Write-Host $padded -ForegroundColor Gray -NoNewline
     Write-Host $Value -ForegroundColor $ValueColor
     [void]$global:report.AppendLine("$padded$Value")
+    $cssClass = switch ($ValueColor) {
+        'Green'    { 'green' }
+        'Red'      { 'red' }
+        'Yellow'   { 'yellow' }
+        'Cyan'     { 'cyan' }
+        'White'    { 'white' }
+        'Magenta'  { 'magenta' }
+        default    { 'white' }
+    }
+    $escLabel = [System.Net.WebUtility]::HtmlEncode($padded)
+    $escValue = [System.Net.WebUtility]::HtmlEncode($Value)
+    Write-Html "<div class=`"kv`"><span class=`"label`">$escLabel</span><span class=`"value $cssClass`">$escValue</span></div>"
 }
 
 function Get-ProgressBar {
@@ -76,6 +147,28 @@ $global:sections = [ordered]@{
     'updates'       = @{ Name = 'Windows Update Health';      Enabled = $true }
     'startup'       = @{ Name = 'Startup Programs';           Enabled = $true }
     'network'       = @{ Name = 'Network Adapters';           Enabled = $true }
+    'gpu'           = @{ Name = 'GPU / Display';              Enabled = $true }
+    'battery'       = @{ Name = 'Battery Health';             Enabled = $true }
+}
+
+# Apply CLI arguments to section state
+if ($cliMode) {
+    if ($cliSections.Count -gt 0) {
+        foreach ($key in @($global:sections.Keys)) {
+            $global:sections[$key].Enabled = $false
+        }
+        foreach ($s in $cliSections) {
+            $s = $s.Trim().ToLower()
+            if ($global:sections.Contains($s)) {
+                $global:sections[$s].Enabled = $true
+            }
+        }
+    }
+    if ($cliAll) {
+        foreach ($key in @($global:sections.Keys)) {
+            $global:sections[$key].Enabled = $true
+        }
+    }
 }
 
 # ============================================================
@@ -204,6 +297,12 @@ function Run-Stability {
             Write-KV "Current Score" "$currentRound / 10" -ValueColor $scoreColor
             Write-Both "  (10 = perfectly stable, lower = more failures)" -Color Gray
 
+            $global:gradeData['stability'] = $current
+
+            if ($current -lt 5) {
+                $global:recommendations += @{ Severity='Warning'; Text="Stability score is low ($currentRound/10). Run 'sfc /scannow' and 'DISM /Online /Cleanup-Image /RestoreHealth' to repair system files." }
+            }
+
             if ($metrics.Count -ge 2) {
                 $oldest = $metrics[-1].SystemStabilityIndex
                 $trend = $current - $oldest
@@ -271,6 +370,11 @@ function Run-BSOD {
         }
         if ($bsodCount -eq 0) {
             Write-Both "  No blue screens or unexpected power events found." -Color Green
+        }
+
+        $global:gradeData['bsodCount'] = $bsodCount
+        if ($bsodCount -gt 0) {
+            $global:recommendations += @{ Severity='Warning'; Text="$bsodCount blue screen/power events detected. Update drivers (especially GPU/chipset) and run 'verifier /standard /all' to identify faulty drivers." }
         }
     } catch { Write-Both "  Could not query bugcheck events: $_" -Color Yellow }
 }
@@ -429,6 +533,10 @@ function Run-Sleep {
         Write-KV "Good (>80% HW)" "$goodCount sessions" -ValueColor Green
         Write-KV "Poor (<50% HW)" "$poorCount sessions" -ValueColor $(if ($poorCount -gt 0) { 'Red' } else { 'Green' })
 
+        if ($avgHw -lt 50) {
+            $global:recommendations += @{ Severity='Warning'; Text="Average HW DRIPS is low ($avgHw%). Run 'powercfg /energy' to identify power efficiency issues." }
+        }
+
         Write-Both "" -Color Gray
         Write-Both "  Thresholds: >95% Excellent | 80-95% Good | 50-80% Mediocre | <50% Poor" -Color Gray
         Write-Both "" -Color Gray
@@ -480,6 +588,11 @@ function Run-BootPerf {
                 Write-KV "Boot Duration" "$bootSec seconds" -ValueColor $bootColor
                 if ($data['MainPathBootTime']) { Write-KV "  Main Path" "$([math]::Round([int]$data['MainPathBootTime']/1000,1))s" }
                 if ($data['BootPostBootTime']) { Write-KV "  Post-Boot" "$([math]::Round([int]$data['BootPostBootTime']/1000,1))s" }
+
+                $global:gradeData['bootTimeSec'] = $bootSec
+                if ($bootSec -gt 120) {
+                    $global:recommendations += @{ Severity='Warning'; Text="Boot time is $bootSec seconds. Consider disabling unnecessary startup items in Task Manager > Startup." }
+                }
             }
         } else { Write-Both "  Boot duration data not available." -Color Yellow }
     } catch { Write-Both "  Could not retrieve boot performance: $_" -Color Yellow }
@@ -523,6 +636,10 @@ function Run-BootDegrade {
             $displayName = if ($name.Length -gt 32) { $name.Substring(0, 32) } else { $name }
             $displayFile = if ($file) { Split-Path $file -Leaf } else { "-" }
             Write-Both "    $($displayName.PadRight(33)) ${degradeSec}s".PadRight(44) + "  $displayFile" -Color $c
+
+            if ($degradeSec -ge 10) {
+                $global:recommendations += @{ Severity='Info'; Text="'$name' adds ${degradeSec}s to boot time. Consider disabling it from startup if not essential." }
+            }
         }
     } catch { Write-Both "  Could not retrieve boot degradation data: $_" -Color Yellow }
 }
@@ -585,12 +702,18 @@ function Run-Crashes {
 
         $crashCount = if ($crashes) { $crashes.Count } else { 0 }
         $hangCount = if ($hangs) { $hangs.Count } else { 0 }
+        $totalCrashes = $crashCount + $hangCount
 
-        $totalColor = if (($crashCount + $hangCount) -eq 0) { [ConsoleColor]::Green }
-                      elseif (($crashCount + $hangCount) -le 5) { [ConsoleColor]::Yellow }
+        $totalColor = if ($totalCrashes -eq 0) { [ConsoleColor]::Green }
+                      elseif ($totalCrashes -le 5) { [ConsoleColor]::Yellow }
                       else { [ConsoleColor]::Red }
         Write-KV "Recent Crashes" "$crashCount" -ValueColor $totalColor
         Write-KV "Recent Hangs" "$hangCount" -ValueColor $totalColor
+
+        $global:gradeData['crashCount'] = $totalCrashes
+        if ($totalCrashes -gt 5) {
+            $global:recommendations += @{ Severity='Warning'; Text="$totalCrashes application crashes/hangs detected. Check for driver and software updates, and review crash logs in Event Viewer." }
+        }
 
         if ($crashes) {
             Write-Both "" -Color Gray
@@ -651,6 +774,11 @@ function Run-Memory {
         Write-KV "Free" "$freeGB GB"
         Write-Both "  $(Get-ProgressBar $pct)" -Color $memColor
 
+        $global:gradeData['memoryPct'] = $pct
+        if ($pct -ge 90) {
+            $global:recommendations += @{ Severity='Warning'; Text="Memory usage is at $pct%. Check Task Manager for memory-heavy processes and consider closing unused applications." }
+        }
+
         # Page file
         $pf = Get-CimInstance Win32_PageFileUsage -ErrorAction SilentlyContinue
         if ($pf) {
@@ -672,11 +800,15 @@ function Run-Memory {
 function Run-Disk {
     Write-Header "DISK HEALTH"
     try {
+        $allHealthy = $true
+        $maxUsedPct = 0
+
         $physDisks = Get-PhysicalDisk -ErrorAction SilentlyContinue
         if ($physDisks) {
             Write-Both "  Physical Disks:" -Color Gray
             foreach ($d in $physDisks) {
                 $healthColor = if ($d.HealthStatus -eq 'Healthy') { [ConsoleColor]::Green } else { [ConsoleColor]::Red }
+                if ($d.HealthStatus -ne 'Healthy') { $allHealthy = $false }
                 $type = if ($d.MediaType) { $d.MediaType } else { "Unknown" }
                 $sizeGB = [math]::Round($d.Size / 1GB, 0)
                 $line = "    $($d.FriendlyName)  |  $type  |  ${sizeGB} GB  |  $($d.HealthStatus)"
@@ -693,6 +825,11 @@ function Run-Disk {
             }
         }
 
+        $global:gradeData['diskHealthy'] = $allHealthy
+        if (-not $allHealthy) {
+            $global:recommendations += @{ Severity='Critical'; Text="One or more disks report unhealthy status. Back up your data immediately and consider replacing the affected disk." }
+        }
+
         Write-Both "" -Color Gray
         Write-Both "  Volumes:" -Color Gray
         $volumes = Get-Volume | Where-Object { $_.DriveLetter -and $_.Size -gt 0 } | Sort-Object DriveLetter
@@ -700,12 +837,18 @@ function Run-Disk {
             $volTotalGB = [math]::Round($v.Size / 1GB, 1)
             $volFreeGB  = [math]::Round($v.SizeRemaining / 1GB, 1)
             $usedPct = [math]::Round((($v.Size - $v.SizeRemaining) / $v.Size) * 100, 1)
+            if ($usedPct -gt $maxUsedPct) { $maxUsedPct = $usedPct }
             $volColor = if ($usedPct -lt 80) { [ConsoleColor]::Green }
                         elseif ($usedPct -lt 90) { [ConsoleColor]::Yellow }
                         else { [ConsoleColor]::Red }
             $label = if ($v.FileSystemLabel) { " ($($v.FileSystemLabel))" } else { "" }
             Write-KV "  $($v.DriveLetter):$label" "${volTotalGB} GB total, ${volFreeGB} GB free" -ValueColor $volColor
             Write-Both "    $(Get-ProgressBar $usedPct)" -Color $volColor
+        }
+
+        $global:gradeData['diskMaxPct'] = $maxUsedPct
+        if ($maxUsedPct -ge 90) {
+            $global:recommendations += @{ Severity='Warning'; Text="A volume is $maxUsedPct% full. Run Disk Cleanup or remove unnecessary files to free space." }
         }
     } catch { Write-Both "  Could not retrieve disk info: $_" -Color Yellow }
 }
@@ -717,6 +860,9 @@ function Run-Updates {
         $updateFails = Get-WinEvent -FilterHashtable @{
             LogName='System'; ProviderName='Microsoft-Windows-WindowsUpdateClient'; Level=2,3
         } -MaxEvents 15 -ErrorAction SilentlyContinue
+
+        $failCount = if ($updateFails) { $updateFails.Count } else { 0 }
+        $global:gradeData['updateFailures'] = $failCount
 
         if ($updateFails) {
             $failColor = if ($updateFails.Count -ge 10) { [ConsoleColor]::Red }
@@ -735,6 +881,7 @@ function Run-Updates {
                 $date = $evt.TimeCreated.ToString("yyyy-MM-dd HH:mm")
                 Write-Both "    $date  $short" -Color Yellow
             }
+            $global:recommendations += @{ Severity='Info'; Text="$failCount update failure(s) found. Run Windows Update Troubleshooter: Settings > System > Troubleshoot > Windows Update." }
         } else {
             Write-Both "  No update failures found." -Color Green
         }
@@ -775,6 +922,10 @@ function Run-Network {
                                else { [ConsoleColor]::Red }
                 $speed = if ($a.LinkSpeed) { $a.LinkSpeed } else { "N/A" }
                 Write-KV "  $($a.Name)" "$($a.Status)  |  $speed  |  $($a.InterfaceDescription)" -ValueColor $statusColor
+
+                if ($a.Status -ne 'Up') {
+                    $global:recommendations += @{ Severity='Info'; Text="Network adapter '$($a.Name)' is $($a.Status). Check cable or Wi-Fi connection if this adapter should be active." }
+                }
             }
         } else {
             Write-Both "  No network adapters found." -Color Yellow
@@ -782,11 +933,448 @@ function Run-Network {
     } catch { Write-Both "  Could not retrieve network info: $_" -Color Yellow }
 }
 
+# --- 15. GPU / Display ---
+function Run-GPU {
+    Write-Header "GPU / DISPLAY"
+    try {
+        $gpus = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue
+        if ($gpus) {
+            foreach ($g in $gpus) {
+                $vramMB = [math]::Round($g.AdapterRAM / 1MB, 0)
+                $driverDate = if ($g.DriverDate) { $g.DriverDate.ToString("yyyy-MM-dd") } else { "Unknown" }
+                Write-KV "  $($g.Name)" "$($g.Status)" -ValueColor $(if ($g.Status -eq 'OK') { 'Green' } else { 'Yellow' })
+                Write-KV "    Driver Version" $g.DriverVersion
+                Write-KV "    Driver Date" $driverDate
+                Write-KV "    VRAM" "$(if ($vramMB -gt 0) { "${vramMB} MB" } else { 'N/A (shared)' })"
+                Write-KV "    Resolution" "$($g.CurrentHorizontalResolution)x$($g.CurrentVerticalResolution)"
+
+                if ($g.Status -ne 'OK') {
+                    $global:recommendations += @{ Severity='Warning'; Text="GPU '$($g.Name)' reports status '$($g.Status)'. Update or reinstall graphics drivers." }
+                }
+            }
+        } else {
+            Write-Both "  No GPU information available." -Color Yellow
+        }
+    } catch { Write-Both "  Could not retrieve GPU info: $_" -Color Yellow }
+}
+
+# --- 16. Battery Health ---
+function Run-Battery {
+    Write-Header "BATTERY HEALTH"
+    try {
+        $battery = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+        if (-not $battery) {
+            Write-Both "  No battery detected (desktop system)." -Color Gray
+            return
+        }
+        Write-KV "Status" $battery.Status -ValueColor $(if ($battery.Status -eq 'OK') { 'Green' } else { 'Yellow' })
+        Write-KV "Charge" "$($battery.EstimatedChargeRemaining)%"
+
+        # Try to get design vs full capacity
+        try {
+            $static = Get-CimInstance -Namespace root/WMI -ClassName BatteryStaticData -ErrorAction Stop
+            $full = Get-CimInstance -Namespace root/WMI -ClassName BatteryFullChargedCapacity -ErrorAction Stop
+            if ($static -and $full -and $static.DesignedCapacity -gt 0) {
+                $designCap = $static.DesignedCapacity
+                $fullCap = $full.FullChargedCapacity
+                $wearPct = [math]::Round((1 - $fullCap / $designCap) * 100, 1)
+                $wearColor = if ($wearPct -lt 20) { [ConsoleColor]::Green }
+                             elseif ($wearPct -lt 50) { [ConsoleColor]::Yellow }
+                             else { [ConsoleColor]::Red }
+                Write-KV "Design Capacity" "$designCap mWh"
+                Write-KV "Current Capacity" "$fullCap mWh"
+                Write-KV "Wear Level" "$wearPct%" -ValueColor $wearColor
+                $global:gradeData['batteryWear'] = $wearPct
+                if ($wearPct -ge 80) {
+                    $global:recommendations += @{ Severity='Critical'; Text="Battery is severely degraded ($wearPct% wear). Replace battery." }
+                } elseif ($wearPct -ge 50) {
+                    $global:recommendations += @{ Severity='Warning'; Text="Battery has $wearPct% wear. Consider replacement soon." }
+                }
+            }
+        } catch {}
+
+        try {
+            $cycle = Get-CimInstance -Namespace root/WMI -ClassName BatteryCycleCount -ErrorAction Stop
+            if ($cycle) { Write-KV "Cycle Count" $cycle.CycleCount }
+        } catch {}
+    } catch { Write-Both "  Could not retrieve battery info: $_" -Color Yellow }
+}
+
+# ============================================================
+# Health Grade Calculator
+# ============================================================
+
+function Get-HealthGrade {
+    $score = 0
+
+    # BSODs: 0->+25, 1-2->+15, 3+->0
+    $bsods = if ($global:gradeData.ContainsKey('bsodCount')) { $global:gradeData['bsodCount'] } else { 0 }
+    if ($bsods -eq 0) { $score += 25 }
+    elseif ($bsods -le 2) { $score += 15 }
+
+    # Disk health: all healthy->+20, any not->0
+    $diskOk = if ($global:gradeData.ContainsKey('diskHealthy')) { $global:gradeData['diskHealthy'] } else { $true }
+    if ($diskOk) { $score += 20 }
+
+    # Stability: score/10 * 15
+    $stab = if ($global:gradeData.ContainsKey('stability')) { $global:gradeData['stability'] } else { 10 }
+    $score += [math]::Round(($stab / 10) * 15, 0)
+
+    # Memory usage: <70%->+10, <90%->+5, else 0
+    $mem = if ($global:gradeData.ContainsKey('memoryPct')) { $global:gradeData['memoryPct'] } else { 50 }
+    if ($mem -lt 70) { $score += 10 }
+    elseif ($mem -lt 90) { $score += 5 }
+
+    # Boot time: <60s->+10, <120s->+5, else 0
+    $boot = if ($global:gradeData.ContainsKey('bootTimeSec')) { $global:gradeData['bootTimeSec'] } else { 30 }
+    if ($boot -lt 60) { $score += 10 }
+    elseif ($boot -lt 120) { $score += 5 }
+
+    # Crashes: 0->+10, 1-5->+5, else 0
+    $cr = if ($global:gradeData.ContainsKey('crashCount')) { $global:gradeData['crashCount'] } else { 0 }
+    if ($cr -eq 0) { $score += 10 }
+    elseif ($cr -le 5) { $score += 5 }
+
+    # Update failures: 0->+10, else +3
+    $uf = if ($global:gradeData.ContainsKey('updateFailures')) { $global:gradeData['updateFailures'] } else { 0 }
+    if ($uf -eq 0) { $score += 10 }
+    else { $score += 3 }
+
+    $grade = if ($score -ge 90) { 'A' }
+             elseif ($score -ge 75) { 'B' }
+             elseif ($score -ge 60) { 'C' }
+             elseif ($score -ge 40) { 'D' }
+             else { 'F' }
+
+    return @{ Score = $score; Grade = $grade }
+}
+
+function Show-GradeAscii {
+    param([string]$Grade, [int]$Score)
+
+    $gradeColor = switch ($Grade) {
+        'A' { [ConsoleColor]::Green }
+        'B' { [ConsoleColor]::Green }
+        'C' { [ConsoleColor]::Yellow }
+        'D' { [ConsoleColor]::Red }
+        'F' { [ConsoleColor]::Red }
+        default { [ConsoleColor]::White }
+    }
+
+    $art = switch ($Grade) {
+        'A' { @(
+            "     AAA     ",
+            "    A   A    ",
+            "    AAAAA    ",
+            "    A   A    ",
+            "    A   A    "
+        )}
+        'B' { @(
+            "    BBBB     ",
+            "    B   B    ",
+            "    BBBB     ",
+            "    B   B    ",
+            "    BBBB     "
+        )}
+        'C' { @(
+            "     CCCC    ",
+            "    C        ",
+            "    C        ",
+            "    C        ",
+            "     CCCC    "
+        )}
+        'D' { @(
+            "    DDDD     ",
+            "    D   D    ",
+            "    D   D    ",
+            "    D   D    ",
+            "    DDDD     "
+        )}
+        'F' { @(
+            "    FFFFF    ",
+            "    F        ",
+            "    FFFF     ",
+            "    F        ",
+            "    F        "
+        )}
+    }
+
+    Write-Both "" -Color $gradeColor
+    Write-Both "  Overall Health Grade: $Grade ($Score/100)" -Color $gradeColor
+    foreach ($line in $art) {
+        Write-Both "  $line" -Color $gradeColor
+    }
+    Write-Both "" -Color $gradeColor
+}
+
+# ============================================================
+# Historical Trending
+# ============================================================
+
+function Save-History {
+    param([string]$Grade)
+
+    $entry = @{
+        timestamp    = (Get-Date).ToString('o')
+        stability    = if ($global:gradeData.ContainsKey('stability')) { $global:gradeData['stability'] } else { $null }
+        bootTimeSec  = if ($global:gradeData.ContainsKey('bootTimeSec')) { $global:gradeData['bootTimeSec'] } else { $null }
+        memoryPct    = if ($global:gradeData.ContainsKey('memoryPct')) { $global:gradeData['memoryPct'] } else { $null }
+        diskMaxPct   = if ($global:gradeData.ContainsKey('diskMaxPct')) { $global:gradeData['diskMaxPct'] } else { $null }
+        bsodCount    = if ($global:gradeData.ContainsKey('bsodCount')) { $global:gradeData['bsodCount'] } else { 0 }
+        crashCount   = if ($global:gradeData.ContainsKey('crashCount')) { $global:gradeData['crashCount'] } else { 0 }
+        grade        = $Grade
+    }
+
+    $history = @()
+    if (Test-Path $historyFile) {
+        try {
+            $raw = Get-Content $historyFile -Raw -ErrorAction Stop
+            $loaded = $raw | ConvertFrom-Json -ErrorAction Stop
+            if ($loaded -is [System.Array]) { $history = @($loaded) }
+            else { $history = @($loaded) }
+        } catch { $history = @() }
+    }
+
+    $history += $entry
+
+    # Keep last 30 entries
+    if ($history.Count -gt 30) {
+        $history = $history[($history.Count - 30)..($history.Count - 1)]
+    }
+
+    try {
+        $history | ConvertTo-Json -Depth 5 | Set-Content $historyFile -Encoding UTF8 -Force
+    } catch {}
+
+    return $history
+}
+
+function Show-Trending {
+    param($History)
+
+    if ($History.Count -lt 2) { return }
+
+    Write-Header "HISTORICAL TRENDS"
+
+    $prev = $History[$History.Count - 2]
+    $curr = $History[$History.Count - 1]
+
+    Write-Both "  Comparing with previous run ($($prev.timestamp.Substring(0,19).Replace('T',' '))):" -Color Gray
+
+    $metrics = @(
+        @{ Name='Grade';      Curr=$curr.grade;       Prev=$prev.grade;       IsGrade=$true }
+        @{ Name='Stability';  Curr=$curr.stability;   Prev=$prev.stability;   LowerBetter=$false }
+        @{ Name='Boot Time';  Curr=$curr.bootTimeSec; Prev=$prev.bootTimeSec; LowerBetter=$true; Unit='s' }
+        @{ Name='Memory Use'; Curr=$curr.memoryPct;   Prev=$prev.memoryPct;   LowerBetter=$true; Unit='%' }
+        @{ Name='Disk Use';   Curr=$curr.diskMaxPct;  Prev=$prev.diskMaxPct;  LowerBetter=$true; Unit='%' }
+        @{ Name='BSODs';      Curr=$curr.bsodCount;   Prev=$prev.bsodCount;   LowerBetter=$true }
+        @{ Name='Crashes';    Curr=$curr.crashCount;  Prev=$prev.crashCount;  LowerBetter=$true }
+    )
+
+    foreach ($m in $metrics) {
+        if ($null -eq $m.Curr -or $null -eq $m.Prev) { continue }
+
+        if ($m.IsGrade) {
+            $arrow = if ($m.Curr -eq $m.Prev) { "=" } else { "$($m.Prev) -> $($m.Curr)" }
+            Write-KV $m.Name $arrow
+            continue
+        }
+
+        $delta = [math]::Round($m.Curr - $m.Prev, 1)
+        $unit = if ($m.Unit) { $m.Unit } else { '' }
+        $arrow = if ($delta -gt 0) { "+" } elseif ($delta -lt 0) { "" } else { "" }
+        $deltaStr = "${arrow}${delta}${unit}"
+
+        $improved = if ($m.LowerBetter) { $delta -lt 0 } else { $delta -gt 0 }
+        $worsened = if ($m.LowerBetter) { $delta -gt 0 } else { $delta -lt 0 }
+
+        $c = if ($delta -eq 0) { [ConsoleColor]::White }
+             elseif ($improved) { [ConsoleColor]::Green }
+             else { [ConsoleColor]::Red }
+
+        Write-KV $m.Name "$($m.Curr)${unit}  ($deltaStr)" -ValueColor $c
+    }
+
+    if ($History.Count -ge 3) {
+        Write-Both "" -Color Gray
+        Write-Both "  History ($($History.Count) records):" -Color Gray
+        $recentHistory = if ($History.Count -gt 10) { $History[($History.Count - 10)..($History.Count - 1)] } else { $History }
+        foreach ($h in $recentHistory) {
+            $ts = $h.timestamp.Substring(0, 10)
+            $g = if ($h.grade) { $h.grade } else { '?' }
+            $gc = switch ($g) { 'A' { 'Green' } 'B' { 'Green' } 'C' { 'Yellow' } 'D' { 'Red' } 'F' { 'Red' } default { 'White' } }
+            Write-Both "    $ts  Grade: $g" -Color $gc
+        }
+    }
+}
+
+# ============================================================
+# Recommendations Display
+# ============================================================
+
+function Show-Recommendations {
+    if ($global:recommendations.Count -eq 0) { return }
+
+    Write-Header "RECOMMENDATIONS"
+
+    $severityOrder = @{ 'Critical' = 0; 'Warning' = 1; 'Info' = 2 }
+    $sorted = $global:recommendations | Sort-Object { $severityOrder[$_.Severity] }
+
+    # Deduplicate
+    $seen = @{}
+    $unique = @()
+    foreach ($r in $sorted) {
+        if (-not $seen.ContainsKey($r.Text)) {
+            $seen[$r.Text] = $true
+            $unique += $r
+        }
+    }
+
+    foreach ($r in $unique) {
+        $icon = switch ($r.Severity) {
+            'Critical' { '[!!!]' }
+            'Warning'  { '[ ! ]' }
+            'Info'     { '[ i ]' }
+        }
+        $c = switch ($r.Severity) {
+            'Critical' { [ConsoleColor]::Red }
+            'Warning'  { [ConsoleColor]::Yellow }
+            'Info'     { [ConsoleColor]::Cyan }
+        }
+        Write-Both "  $icon $($r.Text)" -Color $c
+    }
+}
+
+# ============================================================
+# HTML Report Generator
+# ============================================================
+
+function Generate-HtmlReport {
+    param([string]$Grade, [int]$Score, [double]$ElapsedSec, [int]$SectionCount)
+
+    $gradeColor = switch ($Grade) {
+        'A' { '#22c55e' }
+        'B' { '#86efac' }
+        'C' { '#eab308' }
+        'D' { '#ef4444' }
+        'F' { '#dc2626' }
+        default { '#9ca3af' }
+    }
+
+    $recHtml = ""
+    if ($global:recommendations.Count -gt 0) {
+        $severityOrder = @{ 'Critical' = 0; 'Warning' = 1; 'Info' = 2 }
+        $sorted = $global:recommendations | Sort-Object { $severityOrder[$_.Severity] }
+        $seen = @{}
+        foreach ($r in $sorted) {
+            if ($seen.ContainsKey($r.Text)) { continue }
+            $seen[$r.Text] = $true
+            $badgeColor = switch ($r.Severity) {
+                'Critical' { '#ef4444' }
+                'Warning'  { '#eab308' }
+                'Info'     { '#06b6d4' }
+            }
+            $escaped = [System.Net.WebUtility]::HtmlEncode($r.Text)
+            $recHtml += "<div class=`"rec`"><span class=`"badge`" style=`"background:$badgeColor`">$($r.Severity)</span> $escaped</div>`n"
+        }
+    }
+
+    $timingsHtml = ""
+    if ($global:sectionTimings.Count -gt 0) {
+        foreach ($key in $global:sectionTimings.Keys) {
+            $t = $global:sectionTimings[$key]
+            $timingsHtml += "<div class=`"timing`">$([System.Net.WebUtility]::HtmlEncode($key)): $($t)s</div>`n"
+        }
+    }
+
+    $sectionsBody = $global:htmlContent.ToString()
+    # Remove leading </details> if present (from first Write-Header call)
+    if ($sectionsBody.StartsWith("</details>")) {
+        $sectionsBody = $sectionsBody.Substring(10)
+    }
+    # Close last details tag
+    $sectionsBody += "</details>"
+
+    $reportDateStr = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+    $html = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>System Health Report - $reportDateStr</title>
+<style>
+  :root { --bg: #0f172a; --surface: #1e293b; --border: #334155; --text: #e2e8f0; --text-dim: #94a3b8; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; background: var(--bg); color: var(--text); padding: 20px; line-height: 1.5; font-size: 13px; }
+  .container { max-width: 960px; margin: 0 auto; }
+  .banner { text-align: center; padding: 24px; background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 20px; }
+  .banner h1 { font-size: 20px; color: #67e8f9; margin-bottom: 4px; }
+  .banner .date { color: var(--text-dim); font-size: 12px; }
+  .grade-badge { display: inline-flex; align-items: center; justify-content: center; width: 72px; height: 72px; border-radius: 50%; font-size: 36px; font-weight: bold; color: #0f172a; margin: 16px 0 8px; border: 3px solid rgba(255,255,255,0.15); }
+  .grade-score { color: var(--text-dim); font-size: 14px; }
+  details { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+  summary.section-header { cursor: pointer; padding: 12px 16px; font-size: 14px; font-weight: bold; color: #67e8f9; background: rgba(103,232,249,0.05); border-bottom: 1px solid var(--border); list-style: none; }
+  summary.section-header::-webkit-details-marker { display: none; }
+  summary.section-header::before { content: '\25BC  '; font-size: 10px; }
+  details:not([open]) summary.section-header::before { content: '\25B6  '; }
+  details > div, details > .kv { padding: 0 16px; }
+  details > div:first-of-type { padding-top: 8px; }
+  details > div:last-child { padding-bottom: 8px; }
+  .line { padding: 1px 16px; white-space: pre-wrap; word-break: break-word; }
+  .kv { padding: 1px 16px; }
+  .kv .label { color: var(--text-dim); }
+  .kv .value { }
+  .green { color: #22c55e; } .red { color: #ef4444; } .yellow { color: #eab308; }
+  .cyan { color: #67e8f9; } .white { color: #e2e8f0; } .gray { color: #94a3b8; }
+  .darkgray { color: #64748b; } .magenta { color: #c084fc; }
+  .rec { padding: 8px 12px; margin: 4px 16px; background: rgba(255,255,255,0.03); border-radius: 6px; border-left: 3px solid var(--border); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; color: #0f172a; margin-right: 8px; text-transform: uppercase; }
+  .timing { display: inline-block; padding: 2px 8px; margin: 2px; background: rgba(255,255,255,0.05); border-radius: 4px; font-size: 11px; color: var(--text-dim); }
+  .footer { text-align: center; padding: 16px; color: var(--text-dim); font-size: 12px; border-top: 1px solid var(--border); margin-top: 20px; }
+  .recs-section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 10px; }
+  .recs-section h2 { color: #67e8f9; font-size: 14px; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+  <div class="banner">
+    <h1>WINDOWS SYSTEM HEALTH REPORT</h1>
+    <div class="date">Generated: $reportDateStr</div>
+    <div class="grade-badge" style="background: $gradeColor;">$Grade</div>
+    <div class="grade-score">Score: $Score / 100</div>
+  </div>
+
+  $sectionsBody
+
+  $(if ($recHtml) { @"
+  <div class="recs-section">
+    <h2>RECOMMENDATIONS</h2>
+    $recHtml
+  </div>
+"@ })
+
+  <div class="footer">
+    $SectionCount sections completed in $ElapsedSec seconds<br>
+    $(if ($timingsHtml) { "Section timings: $timingsHtml" })
+  </div>
+</div>
+</body>
+</html>
+"@
+
+    return $html
+}
+
 # ============================================================
 # Main Execution
 # ============================================================
 
-Show-Menu
+# Show menu only if no CLI arguments were provided
+if (-not $cliMode) {
+    Show-Menu
+}
 
 Clear-Host
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -800,21 +1388,59 @@ $banner = @"
 "@
 Write-Both $banner -Color Cyan
 
-# Run selected sections
-if (IsEnabled 'sysinfo')      { Run-SysInfo }
-if (IsEnabled 'stability')    { Run-Stability }
-if (IsEnabled 'bsod')         { Run-BSOD }
-if (IsEnabled 'shutdown')     { Run-Shutdown }
-if (IsEnabled 'sleep')        { Run-Sleep }
-if (IsEnabled 'bootperf')     { Run-BootPerf }
-if (IsEnabled 'bootdegrade')  { Run-BootDegrade }
-if (IsEnabled 'shutdownperf') { Run-ShutdownPerf }
-if (IsEnabled 'crashes')      { Run-Crashes }
-if (IsEnabled 'memory')       { Run-Memory }
-if (IsEnabled 'disk')         { Run-Disk }
-if (IsEnabled 'updates')      { Run-Updates }
-if (IsEnabled 'startup')      { Run-Startup }
-if (IsEnabled 'network')      { Run-Network }
+# Count enabled sections
+$global:enabledTotal = ($global:sections.Values | Where-Object { $_.Enabled }).Count
+
+# Section dispatch table
+$sectionFunctions = [ordered]@{
+    'sysinfo'       = { Run-SysInfo }
+    'stability'     = { Run-Stability }
+    'bsod'          = { Run-BSOD }
+    'shutdown'      = { Run-Shutdown }
+    'sleep'         = { Run-Sleep }
+    'bootperf'      = { Run-BootPerf }
+    'bootdegrade'   = { Run-BootDegrade }
+    'shutdownperf'  = { Run-ShutdownPerf }
+    'crashes'       = { Run-Crashes }
+    'memory'        = { Run-Memory }
+    'disk'          = { Run-Disk }
+    'updates'       = { Run-Updates }
+    'startup'       = { Run-Startup }
+    'network'       = { Run-Network }
+    'gpu'           = { Run-GPU }
+    'battery'       = { Run-Battery }
+}
+
+# Run selected sections with progress and timing
+foreach ($key in $sectionFunctions.Keys) {
+    if (-not (IsEnabled $key)) { continue }
+    $global:sectionIndex++
+    $sectionName = $global:sections[$key].Name
+
+    Write-Host "`n[$global:sectionIndex/$global:enabledTotal] Running $sectionName..." -ForegroundColor Cyan
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    & $sectionFunctions[$key]
+    $sw.Stop()
+    $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+    $global:sectionTimings[$sectionName] = $elapsed
+
+    Write-Host "  (completed in ${elapsed}s)" -ForegroundColor DarkGray
+}
+
+# Calculate health grade
+$gradeResult = Get-HealthGrade
+$healthGrade = $gradeResult.Grade
+$healthScore = $gradeResult.Score
+
+Show-GradeAscii -Grade $healthGrade -Score $healthScore
+
+# Show recommendations
+Show-Recommendations
+
+# Historical trending
+$history = Save-History -Grade $healthGrade
+Show-Trending -History $history
 
 # Footer
 $stopwatch.Stop()
@@ -830,6 +1456,7 @@ $footer = @"
 "@
 Write-Both $footer -Color Cyan
 
+# Save text report
 try {
     $global:report.ToString() | Set-Content -Path $reportFile -Encoding UTF8
     # Restrict report file to current user + admins only
@@ -845,4 +1472,32 @@ try {
     Write-Host "  Report file saved successfully." -ForegroundColor Green
 } catch {
     Write-Host "  WARNING: Could not save report file: $_" -ForegroundColor Red
+}
+
+# Generate and save HTML report
+try {
+    $htmlOutput = Generate-HtmlReport -Grade $healthGrade -Score $healthScore -ElapsedSec $elapsed -SectionCount $enabledCount
+    $htmlOutput | Set-Content -Path $htmlReportFile -Encoding UTF8
+    try {
+        $acl = Get-Acl $htmlReportFile
+        $acl.SetAccessRuleProtection($true, $false)
+        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators","FullControl","Allow")
+        $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule($env:USERNAME,"FullControl","Allow")
+        $acl.SetAccessRule($adminRule)
+        $acl.SetAccessRule($userRule)
+        Set-Acl $htmlReportFile $acl
+    } catch {}
+    Write-Host "  HTML report saved: $htmlReportFile" -ForegroundColor Green
+} catch {
+    Write-Host "  WARNING: Could not save HTML report: $_" -ForegroundColor Red
+}
+
+# Clipboard export
+if ($cliClipboard) {
+    try {
+        $global:report.ToString() | Set-Clipboard
+        Write-Host "  Report copied to clipboard." -ForegroundColor Green
+    } catch {
+        Write-Host "  WARNING: Could not copy to clipboard: $_" -ForegroundColor Red
+    }
 }
