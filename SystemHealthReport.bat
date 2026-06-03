@@ -3,12 +3,17 @@
 set "SHR_SCRIPT_DIR=%~dp0"
 set "SHR_SCRIPT_PATH=%~f0"
 set "SHR_ARGS=%*"
+rem Help is read-only output: skip UAC elevation so it never prompts.
+rem (Best-effort match; on odd input it harmlessly falls through to normal launch.)
+echo.%SHR_ARGS%| findstr /i /c:"/help" /c:"/?" >nul 2>&1
+if %errorlevel% equ 0 goto run
 net session >nul 2>&1
 if %errorlevel% neq 0 (
     echo Requesting administrator privileges...
     powershell -Command "Start-Process cmd -ArgumentList '/c',('\"'+$env:SHR_SCRIPT_PATH+'\" '+$env:SHR_ARGS) -Verb RunAs"
     exit /b
 )
+:run
 powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((Get-Content -LiteralPath $env:SHR_SCRIPT_PATH -Raw))) $env:SHR_ARGS"
 pause
 exit /b
@@ -28,6 +33,7 @@ $global:gradeData = @{}
 $global:sectionTimings = @{}
 $global:sectionIndex = 0
 $global:enabledTotal = 0
+$global:partialRun = $false
 
 $scriptDir = $env:SHR_SCRIPT_DIR
 if (-not $scriptDir) { $scriptDir = $PWD.Path }
@@ -42,7 +48,7 @@ $historyFile = Join-Path $scriptDir "HealthHistory.json"
 $cliAll = $false
 $cliQuiet = $false
 $cliClipboard = $false
-$cliHtml = $false
+$cliHelp = $false
 $cliSections = @()
 $cliMode = $false
 
@@ -53,7 +59,8 @@ if ($ScriptArgs) {
             '/quiet'     { $cliQuiet = $true; $cliMode = $true }
             '/q'         { $cliQuiet = $true; $cliMode = $true }
             '/clipboard' { $cliClipboard = $true; $cliMode = $true }
-            '/html'      { $cliHtml = $true; $cliMode = $true }
+            '/help'      { $cliHelp = $true }
+            '/[?]'       { $cliHelp = $true }   # [?] = literal '?' (a bare ? is a wildcard here)
             '/sections:*' {
                 $cliMode = $true
                 $parts = $arg.Substring(10) -split ','
@@ -63,21 +70,39 @@ if ($ScriptArgs) {
     }
 }
 
+if ($cliHelp) {
+    Write-Host @"
+Windows System Health Report
+
+Usage:
+  SystemHealthReport.bat [options]
+
+  Run with no options to open the interactive section picker.
+
+Options:
+  /all              Run every section (skips the menu).
+  /quiet, /q        Skip the menu and run the currently enabled sections.
+  /sections:a,b,c   Run only the listed sections (comma-separated keys).
+  /clipboard        Copy the text report to the clipboard when finished.
+  /help, /?         Show this help and exit.
+
+Section keys:
+  sysinfo, stability, boot, memory, disk, crashes, network
+
+Examples:
+  SystemHealthReport.bat /all
+  SystemHealthReport.bat /sections:disk,memory /quiet
+"@ -ForegroundColor Gray
+    exit
+}
+
 # ============================================================
 # Helper Functions
 # ============================================================
 
-function Write-Html {
-    param([string]$Html)
-    [void]$global:htmlContent.AppendLine($Html)
-}
-
-function Write-Both {
-    param([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::Gray, [switch]$NoNewline)
-    if ($NoNewline) { Write-Host $Text -ForegroundColor $Color -NoNewline }
-    else { Write-Host $Text -ForegroundColor $Color }
-    [void]$global:report.AppendLine($Text)
-    $cssClass = switch ($Color) {
+function Get-CssClass {
+    param([ConsoleColor]$Color)
+    switch ($Color) {
         'Green'     { 'green' }
         'Red'       { 'red' }
         'Yellow'    { 'yellow' }
@@ -88,8 +113,60 @@ function Write-Both {
         'Magenta'   { 'magenta' }
         default     { 'gray' }
     }
+}
+
+function Write-Html {
+    param([string]$Html)
+    [void]$global:htmlContent.AppendLine($Html)
+}
+
+# Console + text report only. Used for summary blocks (banner, scorecard,
+# recommendations, trends, footer) that the HTML report renders separately,
+# so they must NOT be appended to the HTML buffer.
+function Write-Console {
+    param([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::Gray, [switch]$NoNewline)
+    if ($NoNewline) { Write-Host $Text -ForegroundColor $Color -NoNewline }
+    else { Write-Host $Text -ForegroundColor $Color }
+    [void]$global:report.AppendLine($Text)
+}
+
+# Console + text report + HTML buffer. Used for the diagnostic section bodies.
+function Write-Both {
+    param([string]$Text, [ConsoleColor]$Color = [ConsoleColor]::Gray, [switch]$NoNewline)
+    Write-Console -Text $Text -Color $Color -NoNewline:$NoNewline
     $escaped = [System.Net.WebUtility]::HtmlEncode($Text)
-    Write-Html "<div class=`"line $cssClass`">$escaped</div>"
+    Write-Html "<div class=`"line $(Get-CssClass $Color)`">$escaped</div>"
+}
+
+# Restrict a file to the current user + local Administrators (defence in depth:
+# reports aggregate system data useful for reconnaissance).
+function Set-RestrictiveAcl {
+    param([string]$Path)
+    try {
+        $acl = Get-Acl $Path
+        $acl.SetAccessRuleProtection($true, $false)
+        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators","FullControl","Allow")
+        $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule($env:USERNAME,"FullControl","Allow")
+        $acl.SetAccessRule($adminRule)
+        $acl.SetAccessRule($userRule)
+        Set-Acl $Path $acl
+    } catch {}
+}
+
+# Console-only section header / key-value, for summary blocks that the HTML
+# report renders separately.
+function Write-ConsoleHeader {
+    param([string]$Title)
+    $line = "-" * 58
+    Write-Console "" -Color Gray
+    Write-Console "--- $Title $($line.Substring(0, [math]::Max(0, 58 - $Title.Length - 5)))" -Color Cyan
+}
+
+function Write-ConsoleKV {
+    param([string]$Label, [string]$Value, [ConsoleColor]$ValueColor = [ConsoleColor]::White)
+    Write-Host "  $($Label.PadRight(20)): " -ForegroundColor Gray -NoNewline
+    Write-Host $Value -ForegroundColor $ValueColor
+    [void]$global:report.AppendLine("  $($Label.PadRight(20)): $Value")
 }
 
 function Write-Header {
@@ -107,15 +184,7 @@ function Write-KV {
     Write-Host $padded -ForegroundColor Gray -NoNewline
     Write-Host $Value -ForegroundColor $ValueColor
     [void]$global:report.AppendLine("$padded$Value")
-    $cssClass = switch ($ValueColor) {
-        'Green'    { 'green' }
-        'Red'      { 'red' }
-        'Yellow'   { 'yellow' }
-        'Cyan'     { 'cyan' }
-        'White'    { 'white' }
-        'Magenta'  { 'magenta' }
-        default    { 'white' }
-    }
+    $cssClass = Get-CssClass $ValueColor
     $escLabel = [System.Net.WebUtility]::HtmlEncode($padded)
     $escValue = [System.Net.WebUtility]::HtmlEncode($Value)
     Write-Html "<div class=`"kv`"><span class=`"label`">$escLabel</span><span class=`"value $cssClass`">$escValue</span></div>"
@@ -764,44 +833,103 @@ function Run-SilentCollectors {
 }
 
 # ============================================================
+# Scorecard Metric Definitions (single source of truth)
+# ============================================================
+# Both the console scorecard and the HTML report iterate this list, so the
+# OK/WARN/FAIL thresholds and bar math live in exactly one place.
+
+$global:metricDefs = @(
+    @{ Key='stability';      Name='Stability';   Fmt={ param($v) "$([math]::Round($v,1))/10" };           PctFn={ param($v) $v*10 };                                          StatusFn={ param($v) if($v -ge 8){'OK'}elseif($v -ge 5){'WARN'}else{'FAIL'} } }
+    @{ Key='bsodCount';      Name='BSODs';        Fmt={ param($v) "$v" };                                  PctFn={ param($v) if($v -eq 0){100}elseif($v -le 2){60}else{10} };   StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -le 2){'WARN'}else{'FAIL'} } }
+    @{ Key='bootTimeSec';    Name='Boot Time';    Fmt={ param($v) "${v}s" };                               PctFn={ param($v) [math]::Max(0,[math]::Min(100,100-($v/1.8))) };    StatusFn={ param($v) if($v -lt 60){'OK'}elseif($v -lt 120){'WARN'}else{'FAIL'} } }
+    @{ Key='memoryPct';      Name='Memory';       Fmt={ param($v) "$v% used" };                            PctFn={ param($v) 100-$v };                                         StatusFn={ param($v) if($v -lt 70){'OK'}elseif($v -lt 90){'WARN'}else{'FAIL'} } }
+    @{ Key='diskHealthy';    Name='Disk Health';  Fmt={ param($v) if($v){'Healthy'}else{'UNHEALTHY'} };    PctFn={ param($v) if($v){100}else{0} };                             StatusFn={ param($v) if($v){'OK'}else{'FAIL'} } }
+    @{ Key='diskMaxPct';     Name='Disk Space';   Fmt={ param($v) "$v% used" };                            PctFn={ param($v) 100-$v };                                         StatusFn={ param($v) if($v -lt 80){'OK'}elseif($v -lt 90){'WARN'}else{'FAIL'} } }
+    @{ Key='crashCount';     Name='Crashes';      Fmt={ param($v) "$v" };                                  PctFn={ param($v) if($v -eq 0){100}elseif($v -le 5){60}else{10} };   StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -le 5){'WARN'}else{'FAIL'} } }
+    @{ Key='updateFailures'; Name='Updates';      Fmt={ param($v) if($v -eq 0){'OK'}else{"$v failures"} }; PctFn={ param($v) if($v -eq 0){100}else{40} };                      StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -lt 5){'WARN'}else{'FAIL'} } }
+    @{ Key='networkOk';      Name='Network';      Fmt={ param($v) if($v){'Connected'}else{'DOWN'} };       PctFn={ param($v) if($v){100}else{0} };                             StatusFn={ param($v) if($v){'OK'}else{'FAIL'} } }
+    @{ Key='gpuOk';          Name='GPU';          Fmt={ param($v) if($v){'OK'}else{'Issue'} };             PctFn={ param($v) if($v){100}else{30} };                            StatusFn={ param($v) if($v){'OK'}else{'WARN'} } }
+    @{ Key='sleepDrips';     Name='Sleep DRIPS';  Fmt={ param($v) "$v%" };                                 PctFn={ param($v) $v };                                             StatusFn={ param($v) if($v -ge 80){'OK'}elseif($v -ge 50){'WARN'}else{'FAIL'} } }
+    @{ Key='batteryWear';    Name='Battery';      Fmt={ param($v) "$v% wear" };                            PctFn={ param($v) 100-$v };                                         StatusFn={ param($v) if($v -lt 20){'OK'}elseif($v -lt 50){'WARN'}else{'FAIL'} } }
+)
+
+function Get-StatusConsoleColor {
+    param([string]$Status)
+    switch ($Status) {
+        'OK'   { [ConsoleColor]::Green }
+        'WARN' { [ConsoleColor]::Yellow }
+        'FAIL' { [ConsoleColor]::Red }
+        default { [ConsoleColor]::White }
+    }
+}
+
+function Get-StatusHexColor {
+    param([string]$Status)
+    switch ($Status) {
+        'OK'   { '#22c55e' }
+        'WARN' { '#eab308' }
+        'FAIL' { '#ef4444' }
+        default { '#9ca3af' }
+    }
+}
+
+function Get-GradeHexColor {
+    param([string]$Grade)
+    switch ($Grade) {
+        'A' { '#22c55e' }
+        'B' { '#86efac' }
+        'C' { '#eab308' }
+        'D' { '#f59e0b' }
+        'F' { '#ef4444' }
+        default { '#9ca3af' }
+    }
+}
+
+# ============================================================
 # Health Grade Calculator
 # ============================================================
+# Each measured metric contributes up to its weight. The score is normalised
+# over the weights of the metrics actually measured, so a partial run is graded
+# fairly on what it checked rather than assuming optimistic defaults.
 
 function Get-HealthGrade {
-    $score = 0
+    $earned = 0.0
+    $possible = 0.0
 
-    # BSODs: 0->+25, 1-2->+15, 3+->0
-    $bsods = if ($global:gradeData.ContainsKey('bsodCount')) { $global:gradeData['bsodCount'] } else { 0 }
-    if ($bsods -eq 0) { $score += 25 }
-    elseif ($bsods -le 2) { $score += 15 }
+    if ($global:gradeData.ContainsKey('bsodCount')) {
+        $possible += 25
+        $b = $global:gradeData['bsodCount']
+        if ($b -eq 0) { $earned += 25 } elseif ($b -le 2) { $earned += 15 }
+    }
+    if ($global:gradeData.ContainsKey('diskHealthy')) {
+        $possible += 20
+        if ($global:gradeData['diskHealthy']) { $earned += 20 }
+    }
+    if ($global:gradeData.ContainsKey('stability')) {
+        $possible += 15
+        $earned += [math]::Round(($global:gradeData['stability'] / 10) * 15, 2)
+    }
+    if ($global:gradeData.ContainsKey('memoryPct')) {
+        $possible += 10
+        $m = $global:gradeData['memoryPct']
+        if ($m -lt 70) { $earned += 10 } elseif ($m -lt 90) { $earned += 5 }
+    }
+    if ($global:gradeData.ContainsKey('bootTimeSec')) {
+        $possible += 10
+        $bt = $global:gradeData['bootTimeSec']
+        if ($bt -lt 60) { $earned += 10 } elseif ($bt -lt 120) { $earned += 5 }
+    }
+    if ($global:gradeData.ContainsKey('crashCount')) {
+        $possible += 10
+        $c = $global:gradeData['crashCount']
+        if ($c -eq 0) { $earned += 10 } elseif ($c -le 5) { $earned += 5 }
+    }
+    if ($global:gradeData.ContainsKey('updateFailures')) {
+        $possible += 10
+        if ($global:gradeData['updateFailures'] -eq 0) { $earned += 10 } else { $earned += 3 }
+    }
 
-    # Disk health: all healthy->+20, any not->0
-    $diskOk = if ($global:gradeData.ContainsKey('diskHealthy')) { $global:gradeData['diskHealthy'] } else { $true }
-    if ($diskOk) { $score += 20 }
-
-    # Stability: score/10 * 15
-    $stab = if ($global:gradeData.ContainsKey('stability')) { $global:gradeData['stability'] } else { 10 }
-    $score += [math]::Round(($stab / 10) * 15, 0)
-
-    # Memory usage: <70%->+10, <90%->+5, else 0
-    $mem = if ($global:gradeData.ContainsKey('memoryPct')) { $global:gradeData['memoryPct'] } else { 50 }
-    if ($mem -lt 70) { $score += 10 }
-    elseif ($mem -lt 90) { $score += 5 }
-
-    # Boot time: <60s->+10, <120s->+5, else 0
-    $boot = if ($global:gradeData.ContainsKey('bootTimeSec')) { $global:gradeData['bootTimeSec'] } else { 30 }
-    if ($boot -lt 60) { $score += 10 }
-    elseif ($boot -lt 120) { $score += 5 }
-
-    # Crashes: 0->+10, 1-5->+5, else 0
-    $cr = if ($global:gradeData.ContainsKey('crashCount')) { $global:gradeData['crashCount'] } else { 0 }
-    if ($cr -eq 0) { $score += 10 }
-    elseif ($cr -le 5) { $score += 5 }
-
-    # Update failures: 0->+10, else +3
-    $uf = if ($global:gradeData.ContainsKey('updateFailures')) { $global:gradeData['updateFailures'] } else { 0 }
-    if ($uf -eq 0) { $score += 10 }
-    else { $score += 3 }
+    $score = if ($possible -gt 0) { [int][math]::Round(($earned / $possible) * 100, 0) } else { 0 }
 
     $grade = if ($score -ge 90) { 'A' }
              elseif ($score -ge 75) { 'B' }
@@ -831,107 +959,31 @@ function Show-Scorecard {
         default { [ConsoleColor]::White }
     }
 
-    Write-Both "" -Color Cyan
-    Write-Both "========================================================" -Color Cyan
-    Write-Both "    SYSTEM HEALTH SCORECARD          Grade: $Grade ($Score/100)" -Color $gradeColor
-    Write-Both "========================================================" -Color Cyan
-
-    # Build scorecard rows from gradeData
-    $rows = @()
-
-    # Stability
-    $stab = if ($global:gradeData.ContainsKey('stability')) { $global:gradeData['stability'] } else { $null }
-    if ($null -ne $stab) {
-        $stabRound = [math]::Round($stab, 1)
-        $stabPct = $stab * 10
-        $stabStatus = if ($stab -ge 8) { 'OK' } elseif ($stab -ge 5) { 'WARN' } else { 'FAIL' }
-        $rows += @{ Name='Stability'; Value="$stabRound/10"; Pct=$stabPct; Status=$stabStatus }
+    # Console + text only: the HTML report renders its own scorecard from the
+    # same $global:metricDefs, so writing here with Write-Both would duplicate it.
+    Write-Console "" -Color Cyan
+    Write-Console "========================================================" -Color Cyan
+    $heading = "    SYSTEM HEALTH SCORECARD          Grade: $Grade ($Score/100)"
+    if ($global:partialRun) { $heading += "  [PARTIAL]" }
+    Write-Console $heading -Color $gradeColor
+    Write-Console "========================================================" -Color Cyan
+    if ($global:partialRun) {
+        Write-Console "    Partial run: grade reflects only the sections that were checked." -Color DarkGray
     }
 
-    # BSODs
-    $bsods = if ($global:gradeData.ContainsKey('bsodCount')) { $global:gradeData['bsodCount'] } else { 0 }
-    $bsodStatus = if ($bsods -eq 0) { 'OK' } elseif ($bsods -le 2) { 'WARN' } else { 'FAIL' }
-    $bsodPct = if ($bsods -eq 0) { 100 } elseif ($bsods -le 2) { 60 } else { 10 }
-    $rows += @{ Name='BSODs'; Value="$bsods"; Pct=$bsodPct; Status=$bsodStatus }
-
-    # Boot Time
-    $boot = if ($global:gradeData.ContainsKey('bootTimeSec')) { $global:gradeData['bootTimeSec'] } else { $null }
-    if ($null -ne $boot) {
-        $bootStatus = if ($boot -lt 60) { 'OK' } elseif ($boot -lt 120) { 'WARN' } else { 'FAIL' }
-        $bootPct = [math]::Max(0, [math]::Min(100, 100 - ($boot / 1.8)))
-        $rows += @{ Name='Boot Time'; Value="${boot}s"; Pct=$bootPct; Status=$bootStatus }
+    foreach ($def in $global:metricDefs) {
+        if (-not $global:gradeData.ContainsKey($def.Key)) { continue }
+        $val = $global:gradeData[$def.Key]
+        if ($null -eq $val) { continue }
+        $status = & $def.StatusFn $val
+        $nameStr = "  $($def.Name)".PadRight(16)
+        $valStr = "$(& $def.Fmt $val)".PadRight(14)
+        $bar = Get-MiniBar -Percent (& $def.PctFn $val)
+        Write-Console "$nameStr $valStr $bar  $status" -Color (Get-StatusConsoleColor $status)
     }
 
-    # Memory
-    $mem = if ($global:gradeData.ContainsKey('memoryPct')) { $global:gradeData['memoryPct'] } else { $null }
-    if ($null -ne $mem) {
-        $memStatus = if ($mem -lt 70) { 'OK' } elseif ($mem -lt 90) { 'WARN' } else { 'FAIL' }
-        $memPct = 100 - $mem
-        $rows += @{ Name='Memory'; Value="$mem% used"; Pct=$memPct; Status=$memStatus }
-    }
-
-    # Disk Health
-    $diskOk = if ($global:gradeData.ContainsKey('diskHealthy')) { $global:gradeData['diskHealthy'] } else { $true }
-    $diskStatus = if ($diskOk) { 'OK' } else { 'FAIL' }
-    $rows += @{ Name='Disk Health'; Value=$(if ($diskOk) { 'Healthy' } else { 'UNHEALTHY' }); Pct=$(if ($diskOk) { 100 } else { 0 }); Status=$diskStatus }
-
-    # Disk Space
-    $diskPct = if ($global:gradeData.ContainsKey('diskMaxPct')) { $global:gradeData['diskMaxPct'] } else { $null }
-    if ($null -ne $diskPct) {
-        $diskSpStatus = if ($diskPct -lt 80) { 'OK' } elseif ($diskPct -lt 90) { 'WARN' } else { 'FAIL' }
-        $rows += @{ Name='Disk Space'; Value="$diskPct% used"; Pct=(100 - $diskPct); Status=$diskSpStatus }
-    }
-
-    # Crashes
-    $crashes = if ($global:gradeData.ContainsKey('crashCount')) { $global:gradeData['crashCount'] } else { 0 }
-    $crashStatus = if ($crashes -eq 0) { 'OK' } elseif ($crashes -le 5) { 'WARN' } else { 'FAIL' }
-    $crashPct = if ($crashes -eq 0) { 100 } elseif ($crashes -le 5) { 60 } else { 10 }
-    $rows += @{ Name='Crashes'; Value="$crashes"; Pct=$crashPct; Status=$crashStatus }
-
-    # Updates
-    $uf = if ($global:gradeData.ContainsKey('updateFailures')) { $global:gradeData['updateFailures'] } else { 0 }
-    $ufStatus = if ($uf -eq 0) { 'OK' } elseif ($uf -lt 5) { 'WARN' } else { 'FAIL' }
-    $rows += @{ Name='Updates'; Value=$(if ($uf -eq 0) { 'OK' } else { "$uf failures" }); Pct=$(if ($uf -eq 0) { 100 } else { 40 }); Status=$ufStatus }
-
-    # Network
-    $netOk = if ($global:gradeData.ContainsKey('networkOk')) { $global:gradeData['networkOk'] } else { $true }
-    $rows += @{ Name='Network'; Value=$(if ($netOk) { 'Connected' } else { 'DOWN' }); Pct=$(if ($netOk) { 100 } else { 0 }); Status=$(if ($netOk) { 'OK' } else { 'FAIL' }) }
-
-    # GPU
-    $gpuOk = if ($global:gradeData.ContainsKey('gpuOk')) { $global:gradeData['gpuOk'] } else { $true }
-    $rows += @{ Name='GPU'; Value=$(if ($gpuOk) { 'OK' } else { 'Issue' }); Pct=$(if ($gpuOk) { 100 } else { 30 }); Status=$(if ($gpuOk) { 'OK' } else { 'WARN' }) }
-
-    # Sleep DRIPS
-    $drips = if ($global:gradeData.ContainsKey('sleepDrips')) { $global:gradeData['sleepDrips'] } else { $null }
-    if ($null -ne $drips) {
-        $dripsStatus = if ($drips -ge 80) { 'OK' } elseif ($drips -ge 50) { 'WARN' } else { 'FAIL' }
-        $rows += @{ Name='Sleep DRIPS'; Value="$drips%"; Pct=$drips; Status=$dripsStatus }
-    }
-
-    # Battery
-    $battWear = if ($global:gradeData.ContainsKey('batteryWear')) { $global:gradeData['batteryWear'] } else { $null }
-    if ($null -ne $battWear) {
-        $battStatus = if ($battWear -lt 20) { 'OK' } elseif ($battWear -lt 50) { 'WARN' } else { 'FAIL' }
-        $rows += @{ Name='Battery'; Value="$battWear% wear"; Pct=(100 - $battWear); Status=$battStatus }
-    }
-
-    # Render rows
-    foreach ($r in $rows) {
-        $nameStr = "  $($r.Name)".PadRight(16)
-        $valStr = "$($r.Value)".PadRight(14)
-        $bar = Get-MiniBar -Percent $r.Pct
-        $statusStr = $r.Status
-        $color = switch ($r.Status) {
-            'OK'   { [ConsoleColor]::Green }
-            'WARN' { [ConsoleColor]::Yellow }
-            'FAIL' { [ConsoleColor]::Red }
-            default { [ConsoleColor]::White }
-        }
-        Write-Both "$nameStr $valStr $bar  $statusStr" -Color $color
-    }
-
-    Write-Both "========================================================" -Color Cyan
-    Write-Both "" -Color Gray
+    Write-Console "========================================================" -Color Cyan
+    Write-Console "" -Color Gray
 }
 
 # ============================================================
@@ -950,6 +1002,7 @@ function Save-History {
         bsodCount    = if ($global:gradeData.ContainsKey('bsodCount')) { $global:gradeData['bsodCount'] } else { 0 }
         crashCount   = if ($global:gradeData.ContainsKey('crashCount')) { $global:gradeData['crashCount'] } else { 0 }
         grade        = $Grade
+        partial      = [bool]$global:partialRun
     }
 
     $history = @()
@@ -981,12 +1034,13 @@ function Show-Trending {
 
     if ($History.Count -lt 2) { return }
 
-    Write-Header "HISTORICAL TRENDS"
+    # Console + text only: the HTML report renders its own trends block.
+    Write-ConsoleHeader "HISTORICAL TRENDS"
 
     $prev = $History[$History.Count - 2]
     $curr = $History[$History.Count - 1]
 
-    Write-Both "  Comparing with previous run ($($prev.timestamp.Substring(0,19).Replace('T',' '))):" -Color Gray
+    Write-Console "  Comparing with previous run ($($prev.timestamp.Substring(0,19).Replace('T',' '))):" -Color Gray
 
     $metrics = @(
         @{ Name='Grade';      Curr=$curr.grade;       Prev=$prev.grade;       IsGrade=$true }
@@ -1003,7 +1057,7 @@ function Show-Trending {
 
         if ($m.IsGrade) {
             $arrow = if ($m.Curr -eq $m.Prev) { "=" } else { "$($m.Prev) -> $($m.Curr)" }
-            Write-KV $m.Name $arrow
+            Write-ConsoleKV $m.Name $arrow
             continue
         }
 
@@ -1019,18 +1073,18 @@ function Show-Trending {
              elseif ($improved) { [ConsoleColor]::Green }
              else { [ConsoleColor]::Red }
 
-        Write-KV $m.Name "$($m.Curr)${unit}  ($deltaStr)" -ValueColor $c
+        Write-ConsoleKV $m.Name "$($m.Curr)${unit}  ($deltaStr)" -ValueColor $c
     }
 
     if ($History.Count -ge 3) {
-        Write-Both "" -Color Gray
-        Write-Both "  History ($($History.Count) records):" -Color Gray
+        Write-Console "" -Color Gray
+        Write-Console "  History ($($History.Count) records):" -Color Gray
         $recentHistory = if ($History.Count -gt 10) { $History[($History.Count - 10)..($History.Count - 1)] } else { $History }
         foreach ($h in $recentHistory) {
             $ts = $h.timestamp.Substring(0, 10)
             $g = if ($h.grade) { $h.grade } else { '?' }
             $gc = switch ($g) { 'A' { 'Green' } 'B' { 'Green' } 'C' { 'Yellow' } 'D' { 'Red' } 'F' { 'Red' } default { 'White' } }
-            Write-Both "    $ts  Grade: $g" -Color $gc
+            Write-Console "    $ts  Grade: $g" -Color $gc
         }
     }
 }
@@ -1042,7 +1096,8 @@ function Show-Trending {
 function Show-Recommendations {
     if ($global:recommendations.Count -eq 0) { return }
 
-    Write-Header "RECOMMENDATIONS"
+    # Console + text only: the HTML report renders its own recommendations block.
+    Write-ConsoleHeader "RECOMMENDATIONS"
 
     $severityOrder = @{ 'Critical' = 0; 'Warning' = 1; 'Info' = 2 }
     $sorted = $global:recommendations | Sort-Object { $severityOrder[$_.Severity] }
@@ -1068,7 +1123,7 @@ function Show-Recommendations {
             'Warning'  { [ConsoleColor]::Yellow }
             'Info'     { [ConsoleColor]::Cyan }
         }
-        Write-Both "  $icon $($r.Text)" -Color $c
+        Write-Console "  $icon $($r.Text)" -Color $c
     }
 }
 
@@ -1077,70 +1132,89 @@ function Show-Recommendations {
 # ============================================================
 
 function Generate-HtmlReport {
-    param([string]$Grade, [int]$Score, [double]$ElapsedSec, [int]$SectionCount)
+    param([string]$Grade, [int]$Score, [double]$ElapsedSec, [int]$SectionCount, $History)
 
-    $gradeColor = switch ($Grade) {
-        'A' { '#22c55e' }
-        'B' { '#86efac' }
-        'C' { '#eab308' }
-        'D' { '#ef4444' }
-        'F' { '#dc2626' }
-        default { '#9ca3af' }
-    }
+    $gradeColor = Get-GradeHexColor $Grade
 
-    # Build scorecard HTML
+    # Scorecard rows come from the same $global:metricDefs the console uses.
     $scorecardRows = @()
-    $scFields = @(
-        @{ Key='stability'; Name='Stability'; Fmt={ param($v) "$([math]::Round($v,1))/10" }; PctFn={ param($v) $v*10 }; StatusFn={ param($v) if($v -ge 8){'OK'}elseif($v -ge 5){'WARN'}else{'FAIL'} } }
-        @{ Key='bsodCount'; Name='BSODs'; Fmt={ param($v) "$v" }; PctFn={ param($v) if($v -eq 0){100}elseif($v -le 2){60}else{10} }; StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -le 2){'WARN'}else{'FAIL'} } }
-        @{ Key='bootTimeSec'; Name='Boot Time'; Fmt={ param($v) "${v}s" }; PctFn={ param($v) [math]::Max(0,[math]::Min(100,100-($v/1.8))) }; StatusFn={ param($v) if($v -lt 60){'OK'}elseif($v -lt 120){'WARN'}else{'FAIL'} } }
-        @{ Key='memoryPct'; Name='Memory'; Fmt={ param($v) "$v% used" }; PctFn={ param($v) 100-$v }; StatusFn={ param($v) if($v -lt 70){'OK'}elseif($v -lt 90){'WARN'}else{'FAIL'} } }
-        @{ Key='diskHealthy'; Name='Disk Health'; Fmt={ param($v) if($v){'Healthy'}else{'UNHEALTHY'} }; PctFn={ param($v) if($v){100}else{0} }; StatusFn={ param($v) if($v){'OK'}else{'FAIL'} } }
-        @{ Key='diskMaxPct'; Name='Disk Space'; Fmt={ param($v) "$v% used" }; PctFn={ param($v) 100-$v }; StatusFn={ param($v) if($v -lt 80){'OK'}elseif($v -lt 90){'WARN'}else{'FAIL'} } }
-        @{ Key='crashCount'; Name='Crashes'; Fmt={ param($v) "$v" }; PctFn={ param($v) if($v -eq 0){100}elseif($v -le 5){60}else{10} }; StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -le 5){'WARN'}else{'FAIL'} } }
-        @{ Key='updateFailures'; Name='Updates'; Fmt={ param($v) if($v -eq 0){'OK'}else{"$v failures"} }; PctFn={ param($v) if($v -eq 0){100}else{40} }; StatusFn={ param($v) if($v -eq 0){'OK'}elseif($v -lt 5){'WARN'}else{'FAIL'} } }
-        @{ Key='networkOk'; Name='Network'; Fmt={ param($v) if($v){'Connected'}else{'DOWN'} }; PctFn={ param($v) if($v){100}else{0} }; StatusFn={ param($v) if($v){'OK'}else{'FAIL'} } }
-        @{ Key='gpuOk'; Name='GPU'; Fmt={ param($v) if($v){'OK'}else{'Issue'} }; PctFn={ param($v) if($v){100}else{30} }; StatusFn={ param($v) if($v){'OK'}else{'WARN'} } }
-        @{ Key='sleepDrips'; Name='Sleep DRIPS'; Fmt={ param($v) "$v%" }; PctFn={ param($v) $v }; StatusFn={ param($v) if($v -ge 80){'OK'}elseif($v -ge 50){'WARN'}else{'FAIL'} } }
-        @{ Key='batteryWear'; Name='Battery'; Fmt={ param($v) "$v% wear" }; PctFn={ param($v) 100-$v }; StatusFn={ param($v) if($v -lt 20){'OK'}elseif($v -lt 50){'WARN'}else{'FAIL'} } }
-    )
-    foreach ($f in $scFields) {
+    foreach ($f in $global:metricDefs) {
         if (-not $global:gradeData.ContainsKey($f.Key)) { continue }
         $val = $global:gradeData[$f.Key]
         if ($null -eq $val) { continue }
         $dispVal = & $f.Fmt $val
-        $pct = & $f.PctFn $val
         $status = & $f.StatusFn $val
-        $sColor = switch ($status) { 'OK' { '#22c55e' } 'WARN' { '#eab308' } 'FAIL' { '#ef4444' } default { '#9ca3af' } }
-        $barW = [math]::Max(0, [math]::Min(100, [math]::Round($pct)))
-        $scorecardRows += "<div class=`"sc-row`"><span class=`"sc-name`">$($f.Name)</span><span class=`"sc-val`" style=`"color:$sColor`">$([System.Net.WebUtility]::HtmlEncode($dispVal))</span><span class=`"sc-bar`"><span class=`"sc-fill`" style=`"width:${barW}%;background:$sColor`"></span></span><span class=`"sc-status`" style=`"color:$sColor`">$status</span></div>`n"
+        $sColor = Get-StatusHexColor $status
+        $barW = [math]::Max(0, [math]::Min(100, [math]::Round((& $f.PctFn $val))))
+        $scorecardRows += "<div class=`"sc-row`"><span class=`"sc-name`">$([System.Net.WebUtility]::HtmlEncode($f.Name))</span><span class=`"sc-val`" style=`"color:$sColor`">$([System.Net.WebUtility]::HtmlEncode($dispVal))</span><span class=`"sc-bar`"><span class=`"sc-fill`" style=`"width:${barW}%;background:$sColor`"></span></span><span class=`"sc-status`" style=`"color:$sColor`">$status</span></div>`n"
     }
     $scorecardHtml = $scorecardRows -join ""
 
+    # Deduplicated, severity-sorted recommendations (shared by summary + list).
+    $severityOrder = @{ 'Critical' = 0; 'Warning' = 1; 'Info' = 2 }
+    $uniqueRecs = @()
+    $seenRec = @{}
+    foreach ($r in ($global:recommendations | Sort-Object { $severityOrder[$_.Severity] })) {
+        if ($seenRec.ContainsKey($r.Text)) { continue }
+        $seenRec[$r.Text] = $true
+        $uniqueRecs += $r
+    }
+    $critCount = @($uniqueRecs | Where-Object { $_.Severity -eq 'Critical' }).Count
+    $warnCount = @($uniqueRecs | Where-Object { $_.Severity -eq 'Warning' }).Count
+    $infoCount = @($uniqueRecs | Where-Object { $_.Severity -eq 'Info' }).Count
+
     $recHtml = ""
-    if ($global:recommendations.Count -gt 0) {
-        $severityOrder = @{ 'Critical' = 0; 'Warning' = 1; 'Info' = 2 }
-        $sorted = $global:recommendations | Sort-Object { $severityOrder[$_.Severity] }
-        $seen = @{}
-        foreach ($r in $sorted) {
-            if ($seen.ContainsKey($r.Text)) { continue }
-            $seen[$r.Text] = $true
-            $badgeColor = switch ($r.Severity) {
-                'Critical' { '#ef4444' }
-                'Warning'  { '#eab308' }
-                'Info'     { '#06b6d4' }
-            }
-            $escaped = [System.Net.WebUtility]::HtmlEncode($r.Text)
-            $recHtml += "<div class=`"rec`"><span class=`"badge`" style=`"background:$badgeColor`">$($r.Severity)</span> $escaped</div>`n"
+    foreach ($r in $uniqueRecs) {
+        $sevClass = switch ($r.Severity) { 'Critical' { 'crit' } 'Warning' { 'warn' } 'Info' { 'info' } default { 'info' } }
+        $escaped = [System.Net.WebUtility]::HtmlEncode($r.Text)
+        $recHtml += "<div class=`"rec rec-$sevClass`"><span class=`"badge badge-$sevClass`">$($r.Severity)</span><span class=`"rec-text`">$escaped</span></div>`n"
+    }
+
+    # At-a-glance issue summary chips.
+    if ($uniqueRecs.Count -eq 0) {
+        $summaryChips = "<span class=`"chip chip-ok`">No issues found</span>"
+    } else {
+        $summaryChips = ""
+        if ($critCount -gt 0) { $summaryChips += "<span class=`"chip chip-crit`">$critCount critical</span>" }
+        if ($warnCount -gt 0) { $summaryChips += "<span class=`"chip chip-warn`">$warnCount warning$(if ($warnCount -ne 1) { 's' })</span>" }
+        if ($infoCount -gt 0) { $summaryChips += "<span class=`"chip chip-info`">$infoCount tip$(if ($infoCount -ne 1) { 's' })</span>" }
+    }
+
+    # Recent grade history as a row of pills.
+    $trendHtml = ""
+    if ($History -and $History.Count -ge 2) {
+        $pillHtml = ""
+        $recent = if ($History.Count -gt 8) { $History[($History.Count - 8)..($History.Count - 1)] } else { $History }
+        foreach ($h in $recent) {
+            $g = if ($h.grade) { "$($h.grade)" } else { '?' }
+            $gc = Get-GradeHexColor $g
+            $ds = "$($h.timestamp)"
+            $d = if ($ds.Length -ge 10) { $ds.Substring(5, 5) } else { $ds }
+            if ($h.partial) { $d += '*' }
+            $pillHtml += "<div class=`"pill`"><span class=`"pill-grade`" style=`"color:$gc`">$g</span><span class=`"pill-date`">$([System.Net.WebUtility]::HtmlEncode($d))</span></div>`n"
         }
+        $partialFootnote = if ($recent | Where-Object { $_.partial }) { "<p class=`"card-sub`" style=`"margin-top:10px;margin-bottom:0`">* partial run &mdash; not directly comparable.</p>" } else { "" }
+        $trendHtml = @"
+  <div class="card">
+    <h2>Trends</h2>
+    <p class="card-sub">Health grade across the last $($recent.Count) run(s).</p>
+    <div class="pills">$pillHtml</div>
+    $partialFootnote
+  </div>
+"@
     }
 
     $timingsHtml = ""
     if ($global:sectionTimings.Count -gt 0) {
         foreach ($key in $global:sectionTimings.Keys) {
             $t = $global:sectionTimings[$key]
-            $timingsHtml += "<div class=`"timing`">$([System.Net.WebUtility]::HtmlEncode($key)): $($t)s</div>`n"
+            $timingsHtml += "<span class=`"timing`">$([System.Net.WebUtility]::HtmlEncode($key)): $($t)s</span>`n"
         }
+    }
+
+    $partialNote = ""
+    if ($global:partialRun) {
+        $partialNote = "<div class=`"partial`">Partial run &mdash; $SectionCount of $($global:sections.Count) sections checked. The grade reflects only what was measured.</div>"
     }
 
     $sectionsBody = $global:htmlContent.ToString()
@@ -1161,74 +1235,137 @@ function Generate-HtmlReport {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>System Health Report - $reportDateStr</title>
 <style>
-  :root { --bg: #0f172a; --surface: #1e293b; --border: #334155; --text: #e2e8f0; --text-dim: #94a3b8; }
+  :root {
+    --bg: #0f172a; --surface: #1a2436; --surface-2: #111a2b; --border: #2b3a52;
+    --text: #e2e8f0; --text-dim: #94a3b8; --accent: #67e8f9;
+    --ok: #22c55e; --warn: #eab308; --fail: #ef4444; --info: #38bdf8;
+    --radius: 10px;
+  }
   * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace; background: var(--bg); color: var(--text); padding: 20px; line-height: 1.5; font-size: 13px; }
-  .container { max-width: 960px; margin: 0 auto; }
-  .banner { text-align: center; padding: 24px; background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%); border: 1px solid var(--border); border-radius: 12px; margin-bottom: 20px; }
-  .banner h1 { font-size: 20px; color: #67e8f9; margin-bottom: 4px; }
-  .banner .date { color: var(--text-dim); font-size: 12px; }
-  .grade-badge { display: inline-flex; align-items: center; justify-content: center; width: 72px; height: 72px; border-radius: 50%; font-size: 36px; font-weight: bold; color: #0f172a; margin: 16px 0 8px; border: 3px solid rgba(255,255,255,0.15); }
-  .grade-score { color: var(--text-dim); font-size: 14px; }
-  details { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
-  summary.section-header { cursor: pointer; padding: 12px 16px; font-size: 14px; font-weight: bold; color: #67e8f9; background: rgba(103,232,249,0.05); border-bottom: 1px solid var(--border); list-style: none; }
-  summary.section-header::-webkit-details-marker { display: none; }
-  summary.section-header::before { content: '\25BC  '; font-size: 10px; }
-  details:not([open]) summary.section-header::before { content: '\25B6  '; }
-  details > div, details > .kv { padding: 0 16px; }
-  details > div:first-of-type { padding-top: 8px; }
-  details > div:last-child { padding-bottom: 8px; }
-  .line { padding: 1px 16px; white-space: pre-wrap; word-break: break-word; }
-  .kv { padding: 1px 16px; }
-  .kv .label { color: var(--text-dim); }
-  .kv .value { }
-  .green { color: #22c55e; } .red { color: #ef4444; } .yellow { color: #eab308; }
-  .cyan { color: #67e8f9; } .white { color: #e2e8f0; } .gray { color: #94a3b8; }
-  .darkgray { color: #64748b; } .magenta { color: #c084fc; }
-  .rec { padding: 8px 12px; margin: 4px 16px; background: rgba(255,255,255,0.03); border-radius: 6px; border-left: 3px solid var(--border); }
-  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; color: #0f172a; margin-right: 8px; text-transform: uppercase; }
-  .timing { display: inline-block; padding: 2px 8px; margin: 2px; background: rgba(255,255,255,0.05); border-radius: 4px; font-size: 11px; color: var(--text-dim); }
-  .footer { text-align: center; padding: 16px; color: var(--text-dim); font-size: 12px; border-top: 1px solid var(--border); margin-top: 20px; }
-  .recs-section { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 10px; }
-  .recs-section h2 { color: #67e8f9; font-size: 14px; margin-bottom: 12px; }
-  .scorecard { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 20px; }
-  .scorecard h2 { color: #67e8f9; font-size: 14px; margin-bottom: 12px; text-align: center; }
-  .sc-row { display: flex; align-items: center; padding: 4px 0; border-bottom: 1px solid rgba(255,255,255,0.03); }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    font-family: 'Cascadia Code', 'Fira Code', ui-monospace, 'Consolas', monospace;
+    background: var(--bg); color: var(--text); padding: 16px; line-height: 1.55;
+    font-size: 13px; -webkit-font-smoothing: antialiased;
+  }
+  .container { max-width: 880px; margin: 0 auto; }
+  h2 { font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); font-weight: 600; margin-bottom: 12px; }
+  .group-label { margin: 22px 2px 10px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 18px; margin-bottom: 14px; }
+  .card-sub { color: var(--text-dim); font-size: 12px; margin: -6px 0 12px; }
+
+  /* Header */
+  .banner { display: flex; align-items: center; gap: 18px; padding: 20px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 14px; }
+  .grade-badge { flex: 0 0 auto; display: inline-flex; flex-direction: column; align-items: center; justify-content: center; width: 78px; height: 78px; border-radius: 16px; font-size: 38px; font-weight: 700; color: #0b1220; line-height: 1; }
+  .grade-badge small { font-size: 10px; font-weight: 600; opacity: 0.8; margin-top: 3px; }
+  .banner-info { min-width: 0; }
+  .banner-info h1 { font-size: 16px; color: var(--text); margin-bottom: 3px; font-weight: 600; }
+  .banner-info .date { color: var(--text-dim); font-size: 12px; margin-bottom: 10px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { display: inline-block; padding: 3px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid transparent; }
+  .chip-ok   { color: var(--ok);   background: rgba(34,197,94,0.10);  border-color: rgba(34,197,94,0.30); }
+  .chip-crit { color: var(--fail); background: rgba(239,68,68,0.10);  border-color: rgba(239,68,68,0.30); }
+  .chip-warn { color: var(--warn); background: rgba(234,179,8,0.10);  border-color: rgba(234,179,8,0.30); }
+  .chip-info { color: var(--info); background: rgba(56,189,248,0.10); border-color: rgba(56,189,248,0.30); }
+  .partial { margin-bottom: 14px; padding: 10px 14px; border-radius: var(--radius); font-size: 12px; color: var(--warn); background: rgba(234,179,8,0.08); border: 1px solid rgba(234,179,8,0.25); }
+
+  /* Scorecard */
+  .sc-row { display: grid; grid-template-columns: 1fr auto; grid-template-areas: "name status" "val val" "bar bar"; gap: 3px 10px; align-items: center; padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
   .sc-row:last-child { border-bottom: none; }
-  .sc-name { width: 110px; color: var(--text-dim); font-size: 12px; }
-  .sc-val { width: 100px; font-size: 12px; font-weight: bold; }
-  .sc-bar { flex: 1; height: 8px; background: rgba(255,255,255,0.05); border-radius: 4px; overflow: hidden; margin: 0 12px; }
-  .sc-fill { height: 100%; border-radius: 4px; transition: width 0.3s; }
-  .sc-status { width: 50px; font-size: 11px; font-weight: bold; text-align: right; }
+  .sc-name { grid-area: name; color: var(--text-dim); font-size: 12px; }
+  .sc-val { grid-area: val; font-size: 12px; font-weight: 600; }
+  .sc-status { grid-area: status; font-size: 10px; font-weight: 700; letter-spacing: 0.05em; text-align: right; }
+  .sc-bar { grid-area: bar; height: 6px; background: rgba(255,255,255,0.06); border-radius: 999px; overflow: hidden; }
+  .sc-fill { display: block; height: 100%; border-radius: 999px; }
+  @media (min-width: 560px) {
+    .sc-row { grid-template-columns: 150px 120px 1fr 48px; grid-template-areas: "name val bar status"; gap: 12px; padding: 6px 0; }
+  }
+
+  /* Recommendations */
+  .rec { display: flex; align-items: flex-start; gap: 10px; padding: 11px 13px; margin-bottom: 8px; background: var(--surface-2); border-radius: 8px; border-left: 3px solid var(--border); }
+  .rec:last-child { margin-bottom: 0; }
+  .rec-crit { border-left-color: var(--fail); }
+  .rec-warn { border-left-color: var(--warn); }
+  .rec-info { border-left-color: var(--info); }
+  .rec-text { font-size: 12.5px; line-height: 1.55; }
+  .badge { flex: 0 0 auto; display: inline-block; padding: 2px 8px; border-radius: 5px; font-size: 10px; font-weight: 700; letter-spacing: 0.04em; color: #0b1220; text-transform: uppercase; }
+  .badge-crit { background: var(--fail); }
+  .badge-warn { background: var(--warn); }
+  .badge-info { background: var(--info); }
+
+  /* Trends */
+  .pills { display: flex; flex-wrap: wrap; gap: 8px; }
+  .pill { display: flex; flex-direction: column; align-items: center; min-width: 50px; padding: 8px 10px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 8px; }
+  .pill-grade { font-size: 18px; font-weight: 700; line-height: 1; }
+  .pill-date { font-size: 10px; color: var(--text-dim); margin-top: 4px; }
+
+  /* Detail sections */
+  details { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 10px; overflow: hidden; }
+  summary.section-header { cursor: pointer; padding: 12px 16px; font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--accent); list-style: none; user-select: none; }
+  summary.section-header:hover { background: rgba(103,232,249,0.04); }
+  summary.section-header::-webkit-details-marker { display: none; }
+  summary.section-header::before { content: '\25B8'; display: inline-block; margin-right: 8px; font-size: 9px; transition: transform 0.15s; }
+  details[open] summary.section-header::before { transform: rotate(90deg); }
+  details[open] summary.section-header { border-bottom: 1px solid var(--border); }
+  .line, .kv { padding: 2px 16px; }
+  details > .line:first-of-type, details > .kv:first-of-type { padding-top: 10px; }
+  details > .line:last-child, details > .kv:last-child { padding-bottom: 12px; }
+  .line { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .kv { display: flex; flex-wrap: wrap; gap: 0 6px; }
+  .kv .label { color: var(--text-dim); white-space: pre-wrap; }
+  .kv .value { overflow-wrap: anywhere; }
+  .green { color: var(--ok); } .red { color: var(--fail); } .yellow { color: var(--warn); }
+  .cyan { color: var(--accent); } .white { color: var(--text); } .gray { color: var(--text-dim); }
+  .darkgray { color: #64748b; } .magenta { color: #c084fc; }
+
+  .timing { display: inline-block; padding: 2px 8px; margin: 2px; background: var(--surface-2); border-radius: 5px; font-size: 11px; color: var(--text-dim); }
+  .footer { text-align: center; padding: 18px 16px 8px; color: var(--text-dim); font-size: 11px; }
+  .footer .timings { margin-top: 8px; }
+
+  @media print {
+    body { background: #fff; color: #111; }
+    .card, .banner, details { border-color: #ccc; background: #fff; }
+    details[open] summary.section-header { border-color: #ccc; }
+    .surface-2, .rec, .pill, .timing { background: #f4f4f5; }
+    summary.section-header, .banner-info h1, h2 { color: #111; }
+    details { break-inside: avoid; }
+  }
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="banner">
-    <h1>WINDOWS SYSTEM HEALTH REPORT</h1>
-    <div class="date">Generated: $reportDateStr</div>
-    <div class="grade-badge" style="background: $gradeColor;">$Grade</div>
-    <div class="grade-score">Score: $Score / 100</div>
-  </div>
+  <header class="banner">
+    <div class="grade-badge" style="background: $gradeColor;" role="img" aria-label="Health grade $Grade, score $Score out of 100">$Grade<small>$Score / 100</small></div>
+    <div class="banner-info">
+      <h1>System Health Report</h1>
+      <div class="date">$reportDateStr</div>
+      <div class="chips">$summaryChips</div>
+    </div>
+  </header>
 
-  <div class="scorecard">
-    <h2>SCORECARD</h2>
+  $partialNote
+
+  <section class="card">
+    <h2>Scorecard</h2>
     $scorecardHtml
-  </div>
-
-  $sectionsBody
+  </section>
 
   $(if ($recHtml) { @"
-  <div class="recs-section">
-    <h2>RECOMMENDATIONS</h2>
+  <section class="card">
+    <h2>Recommendations</h2>
     $recHtml
-  </div>
+  </section>
 "@ })
 
-  <div class="footer">
-    $SectionCount sections completed in $ElapsedSec seconds<br>
-    $(if ($timingsHtml) { "Section timings: $timingsHtml" })
-  </div>
+  $trendHtml
+
+  <h2 class="group-label">Details</h2>
+  $sectionsBody
+
+  <footer class="footer">
+    $SectionCount section(s) completed in $ElapsedSec seconds
+    $(if ($timingsHtml) { "<div class=`"timings`">$timingsHtml</div>" })
+  </footer>
 </div>
 </body>
 </html>
@@ -1256,10 +1393,11 @@ $banner = @"
     Generated: $reportDate
 ========================================================
 "@
-Write-Both $banner -Color Cyan
+Write-Console $banner -Color Cyan
 
 # Count enabled sections
 $global:enabledTotal = ($global:sections.Values | Where-Object { $_.Enabled }).Count
+$global:partialRun = $global:enabledTotal -lt $global:sections.Count
 
 # Section dispatch table
 $sectionFunctions = [ordered]@{
@@ -1318,21 +1456,12 @@ $footer = @"
   Saved to: $reportFile
 ========================================================
 "@
-Write-Both $footer -Color Cyan
+Write-Console $footer -Color Cyan
 
 # Save text report
 try {
     $global:report.ToString() | Set-Content -Path $reportFile -Encoding UTF8
-    # Restrict report file to current user + admins only
-    try {
-        $acl = Get-Acl $reportFile
-        $acl.SetAccessRuleProtection($true, $false)
-        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators","FullControl","Allow")
-        $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule($env:USERNAME,"FullControl","Allow")
-        $acl.SetAccessRule($adminRule)
-        $acl.SetAccessRule($userRule)
-        Set-Acl $reportFile $acl
-    } catch {}
+    Set-RestrictiveAcl $reportFile
     Write-Host "  Report file saved successfully." -ForegroundColor Green
 } catch {
     Write-Host "  WARNING: Could not save report file: $_" -ForegroundColor Red
@@ -1340,17 +1469,9 @@ try {
 
 # Generate and save HTML report
 try {
-    $htmlOutput = Generate-HtmlReport -Grade $healthGrade -Score $healthScore -ElapsedSec $elapsed -SectionCount $enabledCount
+    $htmlOutput = Generate-HtmlReport -Grade $healthGrade -Score $healthScore -ElapsedSec $elapsed -SectionCount $enabledCount -History $history
     $htmlOutput | Set-Content -Path $htmlReportFile -Encoding UTF8
-    try {
-        $acl = Get-Acl $htmlReportFile
-        $acl.SetAccessRuleProtection($true, $false)
-        $adminRule = New-Object System.Security.AccessControl.FileSystemAccessRule("BUILTIN\Administrators","FullControl","Allow")
-        $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule($env:USERNAME,"FullControl","Allow")
-        $acl.SetAccessRule($adminRule)
-        $acl.SetAccessRule($userRule)
-        Set-Acl $htmlReportFile $acl
-    } catch {}
+    Set-RestrictiveAcl $htmlReportFile
     Write-Host "  HTML report saved: $htmlReportFile" -ForegroundColor Green
 } catch {
     Write-Host "  WARNING: Could not save HTML report: $_" -ForegroundColor Red
